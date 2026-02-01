@@ -1,7 +1,7 @@
 # Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 
-name: Build and deploy Node.js app to Azure Web App - animal-identification-bot
+name:  Node.js + Express App
 
 on:
   push:
@@ -54,6 +54,19 @@ jobs:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_3CAEFB6094214B02872ECD1D846412AA }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9F35C7FA76454B98B9E65A6749AC67D1 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_FF70E825229B42D0AA8E509990F6DCC3 }}
+
+      - name: Configure Azure Web App Settings
+        uses: azure/appservice-settings@v1
+        with:
+          app-name: 'animal-identification-bot'
+          app-settings-json: |
+            [
+              { "name": "GEMINI_API_KEY", "value": "${{ secrets.GEMINI_API_KEY }}" },
+              { "name": "TELEGRAM_BOT_TOKEN", "value": "${{ secrets.TELEGRAM_BOT_TOKEN }}" },
+              { "name": "EBIRD_API_KEY", "value": "${{ secrets.EBIRD_API_KEY }}" },
+              { "name": "PORT", "value": "3000" },
+              { "name": "WEBSITE_NODE_DEFAULT_VERSION", "value": "~20" }
+            ]
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp

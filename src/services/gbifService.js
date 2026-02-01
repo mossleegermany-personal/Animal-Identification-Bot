@@ -196,18 +196,23 @@ async function verifyWithGBIF(geminiResult, location = null) {
   
   // Step 3: Verify location if provided
   if (location) {
+    console.log(`   📍 User location input: "${location}"`);
     const coords = await geocodeLocation(location);
     if (coords) {
-      console.log(`   📍 Checking occurrences near ${coords.displayName?.split(',')[0] || location}...`);
+      console.log(`   📍 Geocoded to: ${coords.displayName}`);
+      console.log(`   📍 Checking occurrences near ${location}...`);
       const occurrences = await checkOccurrencesAtLocation(speciesInfo.key, coords);
       result.occurrences = occurrences;
       result.locationVerified = occurrences.hasRecords;
+      result.locationUsed = location;
       
       if (occurrences.hasRecords) {
         console.log(`   ✅ ${occurrences.count} records found in this area`);
       } else {
         console.log(`   ⚠️ No GBIF records in this exact area (may still be present)`);
       }
+    } else {
+      console.log(`   ⚠️ Could not geocode location: "${location}"`);
     }
   }
   

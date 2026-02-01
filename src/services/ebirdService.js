@@ -98,7 +98,78 @@ function getEBirdUrl(speciesCode) {
   return `https://ebird.org/species/${speciesCode}`;
 }
 
+/**
+ * Verify bird identification with eBird taxonomy
+ * Returns the correct species if found, or indicates mismatch
+ */
+async function verifyWithEBird(scientificName) {
+  try {
+    const nameParts = scientificName.split(' ');
+    const genus = nameParts[0].toLowerCase();
+    const species = (nameParts[1] || '').toLowerCase();
+    const speciesName = `${nameParts[0]} ${nameParts[1] || ''}`.trim();
+    
+    console.log(`   🐦 eBird: Verifying "${speciesName}"...`);
+    
+    const taxonomy = await getEBirdTaxonomy();
+    
+    if (!taxonomy) {
+      return { verified: false, found: false };
+    }
+    
+    // Find exact match by scientific name
+    for (const bird of taxonomy) {
+      const birdSciName = (bird.sciName || '').toLowerCase();
+      const birdGenus = birdSciName.split(' ')[0];
+      const birdSpecies = birdSciName.split(' ')[1] || '';
+      
+      // Match genus and species
+      if (birdGenus === genus && birdSpecies === species) {
+        console.log(`   ✅ eBird: Confirmed - ${bird.sciName} (${bird.comName})`);
+        return {
+          verified: true,
+          found: true,
+          matches: true,
+          speciesCode: bird.speciesCode,
+          commonName: bird.comName,
+          scientificName: bird.sciName,
+          eBirdName: bird.sciName
+        };
+      }
+    }
+    
+    // Not found in eBird - try fuzzy match by genus
+    console.log(`   ⚠️ eBird: Species "${speciesName}" not found, searching similar...`);
+    for (const bird of taxonomy) {
+      const birdSciName = (bird.sciName || '').toLowerCase();
+      const birdGenus = birdSciName.split(' ')[0];
+      
+      if (birdGenus === genus) {
+        console.log(`   📝 eBird: Found similar - ${bird.sciName} (${bird.comName})`);
+        return {
+          verified: true,
+          found: true,
+          matches: false,
+          speciesCode: bird.speciesCode,
+          commonName: bird.comName,
+          scientificName: bird.sciName,
+          eBirdName: bird.sciName,
+          originalName: speciesName
+        };
+      }
+    }
+    
+    console.log(`   ❌ eBird: No match found for "${speciesName}"`);
+    return { verified: false, found: false };
+    
+  } catch (error) {
+    console.error('eBird verification error:', error.message);
+    return { verified: false, found: false };
+  }
+}
+
 module.exports = {
   getEBirdSpeciesCode,
-  getEBirdUrl
+  getEBirdUrl,
+  verifyWithEBird
 };

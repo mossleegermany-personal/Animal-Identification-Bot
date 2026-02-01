@@ -2,7 +2,7 @@ const { Bot, InputFile } = require('grammy');
 const { identifyAnimal } = require('../services/geminiService');
 const { getSpeciesPhoto } = require('../services/inaturalistService');
 const { createCompositeImage } = require('../services/imageService');
-const { getEBirdSpeciesCode } = require('../services/ebirdService');
+const { getEBirdSpeciesCode, verifyWithEBird } = require('../services/ebirdService');
 const { verifyWithGBIF } = require('../services/gbifService');
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
@@ -156,17 +156,35 @@ async function processIdentification(ctx, buffer, location) {
     
     const d = result.data;
     
+    // Check if it's a bird (class Aves)
+    const isBird = d.taxonomy?.class?.toLowerCase() === 'aves';
+    
     // Step 2: Verify with GBIF using location
     console.log('\n🌍 Verifying with GBIF...');
+    console.log(`   📍 Location from user: "${location}"`);
     const gbifResult = await verifyWithGBIF(d, location);
     
     // Use GBIF species name if different from Gemini (GBIF takes priority)
     if (gbifResult.verified && !gbifResult.matches && gbifResult.gbifName) {
       console.log(`   📝 Using GBIF species: ${gbifResult.gbifName} (Gemini said: ${d.scientificName})`);
       d.scientificName = gbifResult.gbifName;
-      // Update common name from GBIF if available
-      if (gbifResult.species?.species) {
-        d.scientificName = gbifResult.species.canonicalName || gbifResult.gbifName;
+      if (gbifResult.species?.canonicalName) {
+        d.scientificName = gbifResult.species.canonicalName;
+      }
+    }
+    
+    // Step 3: If bird, also verify with eBird
+    if (isBird) {
+      console.log('\n🐦 Verifying bird with eBird...');
+      const eBirdResult = await verifyWithEBird(d.scientificName);
+      
+      // Use eBird species name if different (eBird takes priority for birds)
+      if (eBirdResult.verified && !eBirdResult.matches && eBirdResult.eBirdName) {
+        console.log(`   📝 Using eBird species: ${eBirdResult.eBirdName}`);
+        d.scientificName = eBirdResult.scientificName;
+        if (eBirdResult.commonName) {
+          d.commonName = eBirdResult.commonName;
+        }
       }
     }
     
@@ -193,8 +211,7 @@ async function processIdentification(ctx, buffer, location) {
     const iNatNameHyphen = iNatPhoto.taxonName.replace(/\s+/g, '-');
     iNaturalistUrl = `https://www.inaturalist.org/taxa/${iNatPhoto.taxonId}-${iNatNameHyphen}`;
     
-    // Check if it's a bird (class Aves)
-    const isBird = d.taxonomy?.class?.toLowerCase() === 'aves';
+    // Bird-specific links (isBird already checked earlier)
     let birdLinks = '';
     if (isBird) {
       // eBird - get species code for direct link
