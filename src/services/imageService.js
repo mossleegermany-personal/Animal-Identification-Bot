@@ -129,6 +129,16 @@ async function createCompositeImage(photoUrl, data) {
         </text>
         
         ${subspeciesSection}
+      </svg>
+    `;
+    
+    const textPanel = await sharp(Buffer.from(textSvg))
+      .png()
+      .toBuffer();
+    
+    // Composite the images side by side
+    const composite = await sharp({
+      create: {
         width: totalWidth,
         height: targetHeight,
         channels: 4,

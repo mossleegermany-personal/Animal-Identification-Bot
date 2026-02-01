@@ -160,8 +160,15 @@ async function processIdentification(ctx, buffer, location) {
     console.log('\n🌍 Verifying with GBIF...');
     const gbifResult = await verifyWithGBIF(d, location);
     
-    // Add GBIF verification info to data for display
-    d.gbifVerification = gbifResult;
+    // Use GBIF species name if different from Gemini (GBIF takes priority)
+    if (gbifResult.verified && !gbifResult.matches && gbifResult.gbifName) {
+      console.log(`   📝 Using GBIF species: ${gbifResult.gbifName} (Gemini said: ${d.scientificName})`);
+      d.scientificName = gbifResult.gbifName;
+      // Update common name from GBIF if available
+      if (gbifResult.species?.species) {
+        d.scientificName = gbifResult.species.canonicalName || gbifResult.gbifName;
+      }
+    }
     
     // Get iNaturalist reference photo (uses species only)
     console.log('\n📷 Getting iNaturalist reference photo...');
