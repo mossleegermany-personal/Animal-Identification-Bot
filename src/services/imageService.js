@@ -2,6 +2,9 @@
 
 const sharp = require('sharp');
 
+// Font family that works across systems (Azure Linux, macOS, Windows)
+const FONT_FAMILY = 'sans-serif';
+
 /**
  * Create a composite image with photo on left, text panel on right
  * Layout: Badges | Names
@@ -12,6 +15,9 @@ async function createCompositeImage(photoUrl, data) {
     
     const { commonName, scientificName, taxonomy, sex, lifeStage, morph } = data;
     const subspecies = taxonomy?.subspecies || 'Not determined';
+    
+    // Debug logging for badge data
+    console.log('   📊 Badge data:', { sex, lifeStage, morph, subspecies: taxonomy?.subspecies });
     
     // Fetch the photo
     const photoResponse = await fetch(photoUrl);
@@ -43,14 +49,17 @@ async function createCompositeImage(photoUrl, data) {
       badges.push({ text: 'SPECIES', color: '#455A64' }); // Gray
     }
     
-    // Sex badge
-    if (sex && !sex.toLowerCase().includes('unknown')) {
+    // Sex badge - improved detection
+    if (sex) {
       const sexLower = sex.toLowerCase();
-      if (sexLower.includes('male') && !sexLower.includes('female')) {
+      // Check for male (but not "female" which contains "male")
+      if ((sexLower.includes('male') && !sexLower.includes('female')) || 
+          sexLower.startsWith('m ') || sexLower === 'm') {
         badges.push({ text: 'MALE', color: '#6A1B9A' }); // Purple
-      } else if (sexLower.includes('female')) {
+      } else if (sexLower.includes('female') || sexLower.startsWith('f ') || sexLower === 'f') {
         badges.push({ text: 'FEMALE', color: '#6A1B9A' }); // Purple
       }
+      // Skip if "unknown", "undetermined", "cannot determine", etc.
     }
     
     // Life stage badge
@@ -64,29 +73,26 @@ async function createCompositeImage(photoUrl, data) {
       badges.push({ text: morph.toUpperCase(), color: '#AD1457' }); // Pink
     }
     
-    // Generate badge SVG - 2 per row
+    // Generate badge SVG - dynamic horizontal layout with smaller gaps
     let badgeSvg = '';
     const headerY = 25;
-    const badgeRowHeight = 40;
+    const badgeGap = 8; // Gap between badges
+    let currentX = 20;
     
-    badges.forEach((badge, index) => {
-      const row = Math.floor(index / 2);
-      const col = index % 2;
-      const xOffset = 20 + col * 180;
-      const yOffset = headerY + row * badgeRowHeight;
-      const textWidth = badge.text.length * 11 + 24;
+    badges.forEach((badge) => {
+      const textWidth = badge.text.length * 9 + 20; // Slightly smaller padding
       
       badgeSvg += `
-        <rect x="${xOffset}" y="${yOffset}" width="${textWidth}" height="32" rx="16" fill="${badge.color}"/>
-        <text x="${xOffset + textWidth/2}" y="${yOffset + 22}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="14" font-weight="bold" fill="white" text-anchor="middle">
+        <rect x="${currentX}" y="${headerY}" width="${textWidth}" height="28" rx="14" fill="${badge.color}"/>
+        <text x="${currentX + textWidth/2}" y="${headerY + 19}" font-family="${FONT_FAMILY}" font-size="12" font-weight="bold" fill="white" text-anchor="middle">
           ${escapeXml(badge.text)}
         </text>
       `;
+      currentX += textWidth + badgeGap;
     });
     
-    // Calculate body start position
-    const badgeRows = Math.ceil(badges.length / 2) || 1;
-    const headerHeight = headerY + badgeRows * badgeRowHeight + 15;
+    // Calculate body start position (single row of badges)
+    const headerHeight = headerY + 28 + 20; // badge height + padding
     
     // === BODY: Name information ===
     const bodyY = headerHeight;
@@ -101,10 +107,10 @@ async function createCompositeImage(photoUrl, data) {
     // Build subspecies section only if valid
     const subspeciesSection = hasValidSubspecies ? `
         <!-- Subspecies section -->
-        <text x="20" y="${bodyY + 110}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="12" fill="#666666" font-weight="bold">
+        <text x="20" y="${bodyY + 110}" font-family="${FONT_FAMILY}" font-size="12" fill="#666666" font-weight="bold">
           SUBSPECIES
         </text>
-        <text x="20" y="${bodyY + 135}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="22" font-style="italic" fill="#999999">
+        <text x="20" y="${bodyY + 135}" font-family="${FONT_FAMILY}" font-size="22" font-style="italic" fill="#999999">
           ${escapeXml(subspecies)}
         </text>
     ` : '';
@@ -121,10 +127,10 @@ async function createCompositeImage(photoUrl, data) {
         <line x1="20" y1="${headerHeight - 5}" x2="${textPanelWidth - 20}" y2="${headerHeight - 5}" stroke="#333333" stroke-width="1"/>
         
         <!-- BODY: Species Info -->
-        <text x="20" y="${bodyY + 35}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="36" font-weight="bold" fill="white">
+        <text x="20" y="${bodyY + 35}" font-family="${FONT_FAMILY}" font-size="36" font-weight="bold" fill="white">
           ${escapeXml(commonName)}
         </text>
-        <text x="20" y="${bodyY + 70}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="20" font-style="italic" fill="#bbbbbb">
+        <text x="20" y="${bodyY + 70}" font-family="${FONT_FAMILY}" font-size="20" font-style="italic" fill="#bbbbbb">
           ${escapeXml(scientificName)}
         </text>
         

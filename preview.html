@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Animal ID Result Preview</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      background: #0a0a0a;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-family: 'DejaVu Sans', 'Liberation Sans', 'FreeSans', sans-serif;
+      padding: 20px;
+    }
+    
+    .result-card {
+      display: flex;
+      max-width: 900px;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    
+    .photo-section {
+      width: 420px;
+      height: 500px;
+      overflow: hidden;
+    }
+    
+    .photo-section img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    
+    .info-section {
+      width: 480px;
+      height: 500px;
+      background: #1a1a1a;
+      padding: 25px 20px;
+      display: flex;
+      flex-direction: column;
+    }
+    
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    
+    .badge {
+      padding: 8px 16px;
+      border-radius: 16px;
+      font-size: 12px;
+      font-weight: bold;
+      color: white;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    
+    .badge-subspecies { background: #1565C0; }
+    .badge-species { background: #455A64; }
+    .badge-male { background: #6A1B9A; }
+    .badge-female { background: #6A1B9A; }
+    .badge-stage { background: #E65100; }
+    .badge-morph { background: #AD1457; }
+    
+    .divider {
+      height: 1px;
+      background: #333;
+      margin: 15px 0;
+    }
+    
+    .species-info {
+      flex: 1;
+    }
+    
+    .common-name {
+      font-size: 32px;
+      font-weight: bold;
+      color: white;
+      margin-bottom: 8px;
+      line-height: 1.2;
+    }
+    
+    .scientific-name {
+      font-size: 18px;
+      font-style: italic;
+      color: #bbbbbb;
+      margin-bottom: 30px;
+    }
+    
+    .subspecies-label {
+      font-size: 11px;
+      font-weight: bold;
+      color: #666666;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 6px;
+    }
+    
+    .subspecies-name {
+      font-size: 20px;
+      font-style: italic;
+      color: #999999;
+    }
+    
+    .links {
+      margin-top: auto;
+      padding-top: 20px;
+      border-top: 1px solid #333;
+      display: flex;
+      gap: 15px;
+    }
+    
+    .links a {
+      color: #64B5F6;
+      text-decoration: none;
+      font-size: 14px;
+    }
+    
+    .links a:hover {
+      text-decoration: underline;
+    }
+    
+    /* Controls for preview */
+    .controls {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      background: #222;
+      padding: 20px;
+      border-radius: 12px;
+      color: white;
+      font-size: 14px;
+    }
+    
+    .controls h3 {
+      margin-bottom: 15px;
+      color: #64B5F6;
+    }
+    
+    .control-group {
+      margin-bottom: 12px;
+    }
+    
+    .control-group label {
+      display: block;
+      margin-bottom: 5px;
+      color: #999;
+    }
+    
+    .control-group input, .control-group select {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #444;
+      border-radius: 6px;
+      background: #333;
+      color: white;
+      font-size: 14px;
+    }
+    
+    .checkbox-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .checkbox-group input {
+      width: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <h3>🎨 Preview Controls</h3>
+    <div class="control-group">
+      <label>Common Name</label>
+      <input type="text" id="commonName" value="Himalayan Vulture" oninput="updatePreview()">
+    </div>
+    <div class="control-group">
+      <label>Scientific Name</label>
+      <input type="text" id="scientificName" value="Gyps himalayensis" oninput="updatePreview()">
+    </div>
+    <div class="control-group">
+      <label>Subspecies</label>
+      <input type="text" id="subspecies" value="" placeholder="Leave empty if none" oninput="updatePreview()">
+    </div>
+    <div class="control-group">
+      <label>Level</label>
+      <select id="level" onchange="updatePreview()">
+        <option value="species">Species</option>
+        <option value="subspecies">Subspecies</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label>Sex</label>
+      <select id="sex" onchange="updatePreview()">
+        <option value="">Unknown</option>
+        <option value="male">Male</option>
+        <option value="female">Female</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label>Life Stage</label>
+      <select id="lifeStage" onchange="updatePreview()">
+        <option value="">Unknown</option>
+        <option value="adult" selected>Adult</option>
+        <option value="juvenile">Juvenile</option>
+        <option value="immature">Immature</option>
+        <option value="chick">Chick</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label>Morph</label>
+      <input type="text" id="morph" value="" placeholder="e.g., Dark, Light" oninput="updatePreview()">
+    </div>
+    <div class="control-group">
+      <label>Photo URL</label>
+      <input type="text" id="photoUrl" value="https://inaturalist-open-data.s3.amazonaws.com/photos/1234/medium.jpg" oninput="updatePreview()">
+    </div>
+  </div>
+
+  <div class="result-card">
+    <div class="photo-section">
+      <img id="photo" src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Gyps_himalayensis_-_Himalayan_Griffon%2C_Tal%2C_Nepal.jpg/800px-Gyps_himalayensis_-_Himalayan_Griffon%2C_Tal%2C_Nepal.jpg" alt="Animal photo">
+    </div>
+    <div class="info-section">
+      <div class="badges" id="badges">
+        <span class="badge badge-species">SPECIES</span>
+        <span class="badge badge-stage">ADULT</span>
+      </div>
+      <div class="divider"></div>
+      <div class="species-info">
+        <div class="common-name" id="displayCommonName">Himalayan Vulture</div>
+        <div class="scientific-name" id="displayScientificName">Gyps himalayensis</div>
+        <div id="subspeciesSection" style="display: none;">
+          <div class="subspecies-label">SUBSPECIES</div>
+          <div class="subspecies-name" id="displaySubspecies"></div>
+        </div>
+      </div>
+      <div class="links">
+        <a href="#">Wikipedia</a>
+        <span style="color: #666;">•</span>
+        <a href="#">iNaturalist</a>
+        <span style="color: #666;">•</span>
+        <a href="#">eBird</a>
+        <span style="color: #666;">•</span>
+        <a href="#">Singapore Birds</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function updatePreview() {
+      const commonName = document.getElementById('commonName').value;
+      const scientificName = document.getElementById('scientificName').value;
+      const subspecies = document.getElementById('subspecies').value;
+      const level = document.getElementById('level').value;
+      const sex = document.getElementById('sex').value;
+      const lifeStage = document.getElementById('lifeStage').value;
+      const morph = document.getElementById('morph').value;
+      const photoUrl = document.getElementById('photoUrl').value;
+
+      // Update display
+      document.getElementById('displayCommonName').textContent = commonName;
+      document.getElementById('displayScientificName').textContent = scientificName;
+      
+      // Subspecies section
+      const subspeciesSection = document.getElementById('subspeciesSection');
+      if (subspecies) {
+        subspeciesSection.style.display = 'block';
+        document.getElementById('displaySubspecies').textContent = subspecies;
+      } else {
+        subspeciesSection.style.display = 'none';
+      }
+
+      // Photo
+      if (photoUrl) {
+        document.getElementById('photo').src = photoUrl;
+      }
+
+      // Build badges
+      let badgesHtml = '';
+      
+      // Level badge
+      if (level === 'subspecies') {
+        badgesHtml += '<span class="badge badge-subspecies">SUBSPECIES</span>';
+      } else {
+        badgesHtml += '<span class="badge badge-species">SPECIES</span>';
+      }
+      
+      // Sex badge
+      if (sex === 'male') {
+        badgesHtml += '<span class="badge badge-male">MALE</span>';
+      } else if (sex === 'female') {
+        badgesHtml += '<span class="badge badge-female">FEMALE</span>';
+      }
+      
+      // Life stage badge
+      if (lifeStage) {
+        badgesHtml += `<span class="badge badge-stage">${lifeStage.toUpperCase()}</span>`;
+      }
+      
+      // Morph badge
+      if (morph) {
+        badgesHtml += `<span class="badge badge-morph">${morph.toUpperCase()}</span>`;
+      }
+      
+      document.getElementById('badges').innerHTML = badgesHtml;
+    }
+
+    // Handle image load errors
+    document.getElementById('photo').onerror = function() {
+      this.src = 'https://via.placeholder.com/420x500/1a1a1a/666?text=No+Image';
+    };
+  </script>
+</body>
+</html>
