@@ -572,10 +572,10 @@ class WeeklyRateLimiter {
   }
 }
 
-// Initialize rate limiter (50/week for groups, 25/week for PM)
+// Initialize rate limiter (50/week for groups, 20/week for PM)
 const rateLimiter = new WeeklyRateLimiter({
   maxGroupRequestsPerWeek: 50,
-  maxPmRequestsPerWeek: 25,
+  maxPmRequestsPerWeek: 20,
   timezone: 'Asia/Singapore',
 });
 
@@ -1852,6 +1852,8 @@ bot.on('message:photo', async (ctx) => {
   
   console.log(`📷 Photo received: chatId=${chatId}, userId=${userId}, msgId=${messageId}, mediaGroupId=${mediaGroupId || 'none'}`);
   
+  // Media group handling disabled for now - each photo handled individually
+  /*
   // For media groups, only show prompt once (on first photo)
   if (mediaGroupId) {
     const collectedPhotos = await mediaGroupCollector.addPhoto(mediaGroupId, ctx);
@@ -1902,111 +1904,52 @@ bot.on('message:photo', async (ctx) => {
     }
     return;
   }
+  */
   
-  // Single photo (no media_group_id) - use batch collector to group photos sent quickly
-  const isFirstPhoto = singlePhotoBatchCollector.addPhoto(ctx);
-  
-  if (!isFirstPhoto) {
-    // Not the first photo - it's been added to the batch, just return
-    console.log(`📷 Photo added to existing batch, returning early`);
-    return;
-  }
-  
-  // First photo - wait for batch collection to complete
-  const batchKey = singlePhotoBatchCollector.getBatchKey(ctx);
-  const collectedPhotos = await singlePhotoBatchCollector.waitForBatch(batchKey);
-  
-  if (!collectedPhotos || collectedPhotos.length === 0) {
-    console.log(`📷 No photos collected in batch`);
-    return;
-  }
-  
-  // Batch collection complete - now process
-  const photoCount = collectedPhotos.length;
-  const threadId = collectedPhotos[0].ctx.message.message_thread_id;
+  // Single photo - handle directly (batching disabled for now)
+  const photos = ctx.message.photo;
+  const largestPhoto = photos[photos.length - 1];
+  const threadId = ctx.message.message_thread_id;
   
   // Check rate limit first
   const limitCheck = rateLimiter.checkLimit(chatId, userId);
   if (!limitCheck.allowed) {
-    console.log(`📷 ${photoCount} photo(s) shared by user ${userId} in chat ${chatId} (rate limited)`);
+    console.log(`📷 Photo shared by user ${userId} in chat ${chatId} (rate limited)`);
     return;
   }
   
-  if (photoCount === 1) {
-    // Single photo - use simple flow
-    const photo = collectedPhotos[0];
-    const photoKey = `photo_${chatId}_${userId}_${photo.messageId}`;
-    
-    pendingPhotos.set(photoKey, {
-      messageId: photo.messageId,
-      chatId,
-      userId,
-      fileId: photo.fileId,
-      threadId,
-      timestamp: Date.now(),
-    });
-    
-    // Auto-expire after 5 minutes
-    setTimeout(() => pendingPhotos.delete(photoKey), 5 * 60 * 1000);
-    
-    // Show prompt with buttons
-    await ctx.api.sendMessage(chatId,
-      `📸 *1 photo received!*\n\n` +
-      `Would you like me to identify the animals?`,
-      {
-        parse_mode: 'Markdown',
-        reply_to_message_id: photo.messageId,
-        message_thread_id: threadId,
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '✅ Yes, identify', callback_data: `id_yes_${photoKey}` },
-            { text: '❌ No thanks', callback_data: `id_no_${photoKey}` }
-          ]]
-        }
+  // Store photo info
+  const photoKey = `photo_${chatId}_${userId}_${messageId}`;
+  pendingPhotos.set(photoKey, {
+    messageId,
+    chatId,
+    userId,
+    fileId: largestPhoto.file_id,
+    threadId,
+    timestamp: Date.now(),
+  });
+  
+  // Auto-expire after 5 minutes
+  setTimeout(() => pendingPhotos.delete(photoKey), 5 * 60 * 1000);
+  
+  // Show prompt with buttons
+  await ctx.api.sendMessage(chatId,
+    `📸 *Photo received!*\n\n` +
+    `Would you like me to identify the animals?`,
+    {
+      parse_mode: 'Markdown',
+      reply_to_message_id: messageId,
+      message_thread_id: threadId,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Yes, identify', callback_data: `id_yes_${photoKey}` },
+          { text: '❌ No thanks', callback_data: `id_no_${photoKey}` }
+        ]]
       }
-    );
-    
-    console.log(`📷 Photo shared in chat ${chatId} by user ${userId} - awaiting identification decision`);
-  } else {
-    // Multiple photos batched together - treat like media group
-    const groupKey = `group_${chatId}_${userId}_${Date.now()}`;
-    
-    // Convert to same format as media group
-    const groupPhotos = collectedPhotos.map(p => ({
-      ctx: p.ctx,
-      photo: p.photo,
-      messageId: p.messageId,
-    }));
-    
-    pendingPhotoGroups.set(groupKey, {
-      photos: groupPhotos,
-      chatId,
-      userId,
-      threadId,
-      timestamp: Date.now(),
-    });
-    
-    // Auto-expire after 5 minutes
-    setTimeout(() => pendingPhotoGroups.delete(groupKey), 5 * 60 * 1000);
-    
-    // Show prompt with buttons
-    await ctx.api.sendMessage(chatId,
-      `📸 *${photoCount} photos received!*\n\n` +
-      `Would you like me to identify the animals?`,
-      {
-        parse_mode: 'Markdown',
-        message_thread_id: threadId,
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '✅ Yes, identify', callback_data: `id_yes_${groupKey}` },
-            { text: '❌ No thanks', callback_data: `id_no_${groupKey}` }
-          ]]
-        }
-      }
-    );
-    
-    console.log(`📷 ${photoCount} photos batched in chat ${chatId} - awaiting identification decision`);
-  }
+    }
+  );
+  
+  console.log(`📷 Photo shared in chat ${chatId} by user ${userId} - awaiting identification decision`);
 });
 
 /**
