@@ -315,24 +315,61 @@ const requestManager = new RequestManager({
 
 // ============================================
 // WEEKLY RATE LIMITER
-// Limits requests per group, resets every Monday 00:00 SST (UTC+8)
+// Limits: 50 requests/week per group, 25 requests/week per user (PM)
+// Resets every Monday 00:00 SST (UTC+8)
 // ============================================
 
 class WeeklyRateLimiter {
   constructor(options = {}) {
-    /** @type {Map<number, {count: number, resetAt: number}>} chatId -> usage data */
+    /** @type {Map<string, {count: number, resetAt: number}>} key -> usage data */
     this.usage = new Map();
     
     // Configuration
     this.config = {
-      maxRequestsPerWeek: options.maxRequestsPerWeek || 50,
+      maxGroupRequestsPerWeek: options.maxGroupRequestsPerWeek || 50,
+      maxPmRequestsPerWeek: options.maxPmRequestsPerWeek || 25,
       timezone: options.timezone || 'Asia/Singapore',  // SST = UTC+8
     };
     
     // Schedule weekly reset check every hour
     this._resetTimer = setInterval(() => this._checkResets(), 3600000);
     
-    console.log(`📊 WeeklyRateLimiter initialized: ${this.config.maxRequestsPerWeek} requests/week per group`);
+    console.log(`📊 WeeklyRateLimiter initialized: ${this.config.maxGroupRequestsPerWeek} requests/week per group, ${this.config.maxPmRequestsPerWeek} requests/week per user (PM)`);
+  }
+
+  /**
+   * Check if chat is a private message (not a group)
+   * @param {number} chatId
+   * @returns {boolean}
+   */
+  _isPrivateChat(chatId) {
+    // Private chats have positive IDs, groups have negative IDs
+    return chatId > 0;
+  }
+
+  /**
+   * Get the rate limit key based on chat type
+   * @param {number} chatId
+   * @param {number} userId
+   * @returns {{key: string, limit: number, isPrivate: boolean}}
+   */
+  _getKeyAndLimit(chatId, userId) {
+    const isPrivate = this._isPrivateChat(chatId);
+    if (isPrivate) {
+      // PM: limit by userId
+      return {
+        key: `user_${userId}`,
+        limit: this.config.maxPmRequestsPerWeek,
+        isPrivate: true,
+      };
+    } else {
+      // Group: limit by chatId
+      return {
+        key: `group_${chatId}`,
+        limit: this.config.maxGroupRequestsPerWeek,
+        isPrivate: false,
+      };
+    }
   }
 
   /**
@@ -369,59 +406,64 @@ class WeeklyRateLimiter {
   }
 
   /**
-   * Get or initialize usage data for a chat
-   * @param {number} chatId
+   * Get or initialize usage data
+   * @param {string} key
    * @returns {{count: number, resetAt: number}}
    */
-  _getUsage(chatId) {
-    if (!this.usage.has(chatId)) {
-      this.usage.set(chatId, {
+  _getUsage(key) {
+    if (!this.usage.has(key)) {
+      this.usage.set(key, {
         count: 0,
         resetAt: this._getNextMondayReset(),
       });
     }
     
-    const data = this.usage.get(chatId);
+    const data = this.usage.get(key);
     
     // Check if reset time has passed
     if (Date.now() >= data.resetAt) {
       data.count = 0;
       data.resetAt = this._getNextMondayReset();
-      console.log(`🔄 Rate limit reset for chat ${chatId}. Next reset: ${new Date(data.resetAt).toISOString()}`);
+      console.log(`🔄 Rate limit reset for ${key}. Next reset: ${new Date(data.resetAt).toISOString()}`);
     }
     
     return data;
   }
 
   /**
-   * Check if a chat can make a request
+   * Check if a request can be made
    * @param {number} chatId
-   * @returns {{allowed: boolean, remaining: number, resetAt: number, resetIn: string}}
+   * @param {number} userId
+   * @returns {{allowed: boolean, remaining: number, resetAt: number, resetIn: string, isPrivate: boolean}}
    */
-  checkLimit(chatId) {
-    const data = this._getUsage(chatId);
-    const remaining = Math.max(0, this.config.maxRequestsPerWeek - data.count);
+  checkLimit(chatId, userId) {
+    const { key, limit, isPrivate } = this._getKeyAndLimit(chatId, userId);
+    const data = this._getUsage(key);
+    const remaining = Math.max(0, limit - data.count);
     const resetIn = this._formatTimeUntilReset(data.resetAt);
     
     return {
-      allowed: data.count < this.config.maxRequestsPerWeek,
+      allowed: data.count < limit,
       remaining,
       resetAt: data.resetAt,
       resetIn,
       used: data.count,
-      limit: this.config.maxRequestsPerWeek,
+      limit,
+      isPrivate,
     };
   }
 
   /**
-   * Consume one request for a chat
+   * Consume one request
    * @param {number} chatId
+   * @param {number} userId
    * @returns {{success: boolean, remaining: number}}
    */
-  consume(chatId) {
-    const data = this._getUsage(chatId);
+  consume(chatId, userId) {
+    const { key, limit, isPrivate } = this._getKeyAndLimit(chatId, userId);
+    const data = this._getUsage(key);
     
-    if (data.count >= this.config.maxRequestsPerWeek) {
+    if (data.count >= limit) {
       return {
         success: false,
         remaining: 0,
@@ -430,9 +472,10 @@ class WeeklyRateLimiter {
     }
     
     data.count++;
-    const remaining = this.config.maxRequestsPerWeek - data.count;
+    const remaining = limit - data.count;
     
-    console.log(`📊 Chat ${chatId} usage: ${data.count}/${this.config.maxRequestsPerWeek} (${remaining} remaining)`);
+    const typeLabel = isPrivate ? `User ${userId}` : `Group ${chatId}`;
+    console.log(`📊 ${typeLabel} usage: ${data.count}/${limit} (${remaining} remaining)`);
     
     return {
       success: true,
@@ -465,10 +508,12 @@ class WeeklyRateLimiter {
   /**
    * Get formatted reset time in SST
    * @param {number} chatId
+   * @param {number} userId
    * @returns {string}
    */
-  getResetTimeFormatted(chatId) {
-    const data = this._getUsage(chatId);
+  getResetTimeFormatted(chatId, userId) {
+    const { key } = this._getKeyAndLimit(chatId, userId);
+    const data = this._getUsage(key);
     const resetDate = new Date(data.resetAt);
     return resetDate.toLocaleString('en-SG', { 
       timeZone: this.config.timezone,
@@ -487,27 +532,30 @@ class WeeklyRateLimiter {
    */
   _checkResets() {
     const now = Date.now();
-    for (const [chatId, data] of this.usage.entries()) {
+    for (const [key, data] of this.usage.entries()) {
       if (now >= data.resetAt) {
         data.count = 0;
         data.resetAt = this._getNextMondayReset();
-        console.log(`🔄 Scheduled reset for chat ${chatId}`);
+        console.log(`🔄 Scheduled reset for ${key}`);
       }
     }
   }
 
   /**
-   * Get usage stats for a chat
+   * Get usage stats
    * @param {number} chatId
+   * @param {number} userId
    * @returns {Object}
    */
-  getStats(chatId) {
-    const data = this._getUsage(chatId);
+  getStats(chatId, userId) {
+    const { key, limit, isPrivate } = this._getKeyAndLimit(chatId, userId);
+    const data = this._getUsage(key);
     return {
-      chatId,
+      key,
+      isPrivate,
       used: data.count,
-      limit: this.config.maxRequestsPerWeek,
-      remaining: Math.max(0, this.config.maxRequestsPerWeek - data.count),
+      limit,
+      remaining: Math.max(0, limit - data.count),
       resetAt: new Date(data.resetAt).toISOString(),
       resetIn: this._formatTimeUntilReset(data.resetAt),
     };
@@ -524,9 +572,10 @@ class WeeklyRateLimiter {
   }
 }
 
-// Initialize rate limiter
+// Initialize rate limiter (50/week for groups, 25/week for PM)
 const rateLimiter = new WeeklyRateLimiter({
-  maxRequestsPerWeek: 50,
+  maxGroupRequestsPerWeek: 50,
+  maxPmRequestsPerWeek: 25,
   timezone: 'Asia/Singapore',
 });
 
@@ -789,10 +838,12 @@ bot.command('help', async (ctx) => {
 // Limit command - check weekly usage
 bot.command('limit', async (ctx) => {
   const chatId = ctx.chat.id;
-  console.log(`📩 /limit command received from chat ${chatId}`);
+  const userId = ctx.from.id;
+  const isPrivate = chatId > 0;
+  console.log(`📩 /limit command received from ${isPrivate ? 'PM' : 'group'} (chat ${chatId}, user ${userId})`);
   
-  const stats = rateLimiter.getStats(chatId);
-  const limitCheck = rateLimiter.checkLimit(chatId);
+  const stats = rateLimiter.getStats(chatId, userId);
+  const limitCheck = rateLimiter.checkLimit(chatId, userId);
   const progressBar = generateProgressBar(stats.used, stats.limit);
   
   // Build status message based on whether limit is exceeded
@@ -805,12 +856,14 @@ bot.command('limit', async (ctx) => {
     statusLine = `✅ Used: ${stats.used}/${stats.limit}`;
   }
   
+  const limitType = isPrivate ? 'Your Personal' : 'Group';
+  
   await ctx.reply(
-    `📊 *Weekly Usage Limit*\n\n` +
+    `📊 *${limitType} Weekly Usage Limit*\n\n` +
     `${progressBar}\n\n` +
     `${statusLine}\n` +
     `📦 Remaining: ${stats.remaining}\n\n` +
-    `🔄 *Resets:* ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
+    `🔄 *Resets:* ${rateLimiter.getResetTimeFormatted(chatId, userId)}\n` +
     `⏳ *Time left:* ${stats.resetIn}`,
     { parse_mode: 'Markdown' }
   );
@@ -894,10 +947,12 @@ bot.callbackQuery('menu_clear', async (ctx) => {
 bot.callbackQuery('menu_limit', async (ctx) => {
   await ctx.answerCallbackQuery();
   const chatId = ctx.callbackQuery.message?.chat?.id;
+  const userId = ctx.from?.id;
   
-  if (chatId) {
-    const stats = rateLimiter.getStats(chatId);
-    const limitCheck = rateLimiter.checkLimit(chatId);
+  if (chatId && userId) {
+    const isPrivate = chatId > 0;
+    const stats = rateLimiter.getStats(chatId, userId);
+    const limitCheck = rateLimiter.checkLimit(chatId, userId);
     const progressBar = generateProgressBar(stats.used, stats.limit);
     
     // Build status message based on whether limit is exceeded
@@ -910,12 +965,14 @@ bot.callbackQuery('menu_limit', async (ctx) => {
       statusLine = `✅ Used: ${stats.used}/${stats.limit}`;
     }
     
+    const limitType = isPrivate ? 'Your Personal' : 'Group';
+    
     await ctx.reply(
-      `📊 *Weekly Usage Limit*\n\n` +
+      `📊 *${limitType} Weekly Usage Limit*\n\n` +
       `${progressBar}\n\n` +
       `${statusLine}\n` +
       `📦 Remaining: ${stats.remaining}\n\n` +
-      `🔄 *Resets:* ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
+      `🔄 *Resets:* ${rateLimiter.getResetTimeFormatted(chatId, userId)}\n` +
       `⏳ *Time left:* ${stats.resetIn}`,
       { parse_mode: 'Markdown' }
     );
@@ -987,12 +1044,13 @@ bot.command('identify', async (ctx) => {
   }
   
   // Check rate limit
-  const limitCheck = rateLimiter.checkLimit(chatId);
+  const limitCheck = rateLimiter.checkLimit(chatId, userId);
   if (!limitCheck.allowed) {
+    const limitType = limitCheck.isPrivate ? 'your personal' : 'this group\'s';
     await ctx.reply(
       `⚠️ *Weekly limit reached*\n\n` +
-      `This group has used all ${limitCheck.limit} identifications for this week.\n\n` +
-      `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
+      `You have used all ${limitCheck.limit} of ${limitType} identifications for this week.\n\n` +
+      `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId, userId)}\n` +
       `⏳ Time remaining: ${limitCheck.resetIn}`,
       { parse_mode: 'Markdown' }
     );
@@ -1045,7 +1103,7 @@ bot.command('identify', async (ctx) => {
       if (exifLocation) {
         // Has EXIF - process immediately
         await processIdentification(ctx, buffer, exifLocation, request.requestId, targetFromCommand);
-        const consumed = rateLimiter.consume(chatId);
+        const consumed = rateLimiter.consume(chatId, userId);
         console.log(`📊 [${request.requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
         requestManager.completeAndRemove(request.requestId);
       } else {
@@ -1170,7 +1228,7 @@ bot.command('skip', async (ctx) => {
         requestManager.updateStatus(requestId, 'processing');
         try {
           await processIdentification(ctx, pendingBuffer, exifLocation, requestId, null);
-          const consumed = rateLimiter.consume(chatId);
+          const consumed = rateLimiter.consume(chatId, userId);
           console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
           requestManager.completeAndRemove(requestId);
         } catch (error) {
@@ -1219,7 +1277,7 @@ bot.command('skip', async (ctx) => {
     try {
       await processIdentification(ctx, pendingBuffer, noLocation, requestId, identifyTarget);
       // Consume rate limit on successful completion
-      const consumed = rateLimiter.consume(chatId);
+      const consumed = rateLimiter.consume(chatId, userId);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
       // Immediately remove request after completion
       requestManager.completeAndRemove(requestId);
@@ -1271,7 +1329,7 @@ bot.command('auto', async (ctx) => {
       requestManager.updateStatus(requestId, 'processing');
       try {
         await processIdentification(ctx, req.buffer, req.exifLocation, requestId, null);
-        const consumed = rateLimiter.consume(chatId);
+        const consumed = rateLimiter.consume(chatId, userId);
         console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
         requestManager.completeAndRemove(requestId);
       } catch (error) {
@@ -1332,7 +1390,7 @@ bot.on('message:text', async (ctx) => {
           
           try {
             await processIdentification(ctx, req.buffer, req.exifLocation, requestId, req.identifyTarget);
-            const consumed = rateLimiter.consume(chatId);
+            const consumed = rateLimiter.consume(chatId, userId);
             console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
             requestManager.completeAndRemove(requestId);
           } catch (error) {
@@ -1398,7 +1456,7 @@ bot.on('message:text', async (ctx) => {
       try {
         await processIdentification(ctx, pendingBuffer, location, requestId, identifyTarget);
         // Consume rate limit on successful completion
-        const consumed = rateLimiter.consume(chatId);
+        const consumed = rateLimiter.consume(chatId, userId);
         console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
         // Immediately remove request after completion
         requestManager.completeAndRemove(requestId);
@@ -1424,6 +1482,99 @@ bot.on('callback_query:data', (ctx) => {
 async function handleCallbackQuery(ctx) {
   const data = ctx.callbackQuery.data;
   const chatId = ctx.callbackQuery.message?.chat?.id;  // Get chat ID from callback message
+  const userId = ctx.from.id;
+  
+  // Handle identification decision buttons (Yes/No)
+  if (data.startsWith('id_yes_') || data.startsWith('id_no_')) {
+    const match = data.match(/^id_(yes|no)_(.+)$/);
+    if (!match) return;
+    
+    const decision = match[1]; // 'yes' or 'no'
+    const key = match[2]; // photo or group key
+    
+    // Answer callback first to remove loading state
+    await ctx.answerCallbackQuery();
+    
+    // Delete the prompt message (the one with buttons)
+    try {
+      await ctx.deleteMessage();
+    } catch (e) {
+      console.log(`⚠️ Could not delete prompt message: ${e.message}`);
+    }
+    
+    if (decision === 'no') {
+      // User declined identification - clean up
+      pendingPhotos.delete(key);
+      pendingPhotoGroups.delete(key);
+      console.log(`📷 User ${userId} declined identification in chat ${chatId}`);
+      return;
+    }
+    
+    // User wants identification
+    console.log(`✅ User ${userId} requested identification in chat ${chatId}`);
+    
+    // Check rate limit
+    const limitCheck = rateLimiter.checkLimit(chatId, userId);
+    if (!limitCheck.allowed) {
+      const limitType = limitCheck.isPrivate ? 'your personal' : 'this group\'s';
+      await ctx.reply(
+        `⚠️ *Weekly limit reached*\n\n` +
+        `You have used all ${limitCheck.limit} of ${limitType} identifications for this week.\n\n` +
+        `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId, userId)}\n` +
+        `⏳ Time remaining: ${limitCheck.resetIn}`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    // Check if it's a photo group or single photo
+    if (key.startsWith('group_')) {
+      const groupData = pendingPhotoGroups.get(key);
+      if (!groupData) {
+        await ctx.reply('❌ Photo data expired. Please send the photos again.');
+        return;
+      }
+      
+      pendingPhotoGroups.delete(key);
+      
+      // Check quota for all photos
+      const photoCount = groupData.photos.length;
+      if (limitCheck.remaining < photoCount) {
+        await ctx.reply(
+          `⚠️ *Not enough quota*\n\n` +
+          `You have ${photoCount} photos but only ${limitCheck.remaining} identifications remaining.\n\n` +
+          `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId, userId)}`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      
+      // Process the media group
+      await processMediaGroup(groupData.photos, chatId, null);
+      
+    } else if (key.startsWith('photo_')) {
+      const photoData = pendingPhotos.get(key);
+      if (!photoData) {
+        await ctx.reply('❌ Photo data expired. Please send the photo again.');
+        return;
+      }
+      
+      pendingPhotos.delete(key);
+      
+      // Create a request for tracking
+      const request = requestManager.createRequest(ctx, { chatId, userId });
+      
+      console.log(`📸 [${request.requestId}] Processing single photo from button (${limitCheck.remaining} requests remaining)`);
+      
+      // Process the photo using stored file_id
+      processSinglePhotoFromFileId(ctx, photoData.fileId, request)
+        .catch(err => {
+          requestManager.updateStatus(request.requestId, 'failed', { error: err });
+          ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
+        });
+    }
+    return;
+  }
   
   if (data.startsWith('details_')) {
     const scientificName = data.replace('details_', '').replace(/_/g, ' ');
@@ -1734,10 +1885,10 @@ bot.on('message:photo', async (ctx) => {
       const photoCount = collectedPhotos.length;
       
       // Check rate limit first
-      const limitCheck = rateLimiter.checkLimit(chatId);
+      const limitCheck = rateLimiter.checkLimit(chatId, userId);
       if (!limitCheck.allowed) {
         // Don't show prompt if rate limited
-        console.log(`📷 ${photoCount} photos shared in chat ${chatId} (rate limited)`);
+        console.log(`📷 ${photoCount} photos shared by user ${userId} in chat ${chatId} (rate limited)`);
         return;
       }
       
@@ -1774,10 +1925,10 @@ bot.on('message:photo', async (ctx) => {
   }
   
   // Single photo - check rate limit first
-  const limitCheck = rateLimiter.checkLimit(chatId);
+  const limitCheck = rateLimiter.checkLimit(chatId, userId);
   if (!limitCheck.allowed) {
     // Don't show prompt if rate limited
-    console.log(`📷 Photo shared in chat ${chatId} (rate limited)`);
+    console.log(`📷 Photo shared by user ${userId} in chat ${chatId} (rate limited)`);
     return;
   }
   
@@ -1815,95 +1966,6 @@ bot.on('message:photo', async (ctx) => {
   );
   
   console.log(`📷 Photo shared in chat ${chatId} by user ${userId} - awaiting identification decision`);
-});
-
-// Handle identification decision buttons (Yes/No)
-bot.callbackQuery(/^id_(yes|no)_(.+)$/, async (ctx) => {
-  const match = ctx.callbackQuery.data.match(/^id_(yes|no)_(.+)$/);
-  if (!match) return;
-  
-  const decision = match[1]; // 'yes' or 'no'
-  const key = match[2]; // photo or group key
-  const chatId = ctx.callbackQuery.message?.chat?.id;
-  const userId = ctx.from.id;
-  
-  // Delete the prompt message
-  try {
-    await ctx.deleteMessage();
-  } catch (e) {}
-  
-  await ctx.answerCallbackQuery();
-  
-  if (decision === 'no') {
-    // User declined identification - clean up
-    pendingPhotos.delete(key);
-    pendingPhotoGroups.delete(key);
-    console.log(`📷 User ${userId} declined identification in chat ${chatId}`);
-    return;
-  }
-  
-  // User wants identification
-  console.log(`✅ User ${userId} requested identification in chat ${chatId}`);
-  
-  // Check rate limit
-  const limitCheck = rateLimiter.checkLimit(chatId);
-  if (!limitCheck.allowed) {
-    await ctx.reply(
-      `⚠️ *Weekly limit reached*\n\n` +
-      `This group has used all ${limitCheck.limit} identifications for this week.\n\n` +
-      `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
-      `⏳ Time remaining: ${limitCheck.resetIn}`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-  
-  // Check if it's a photo group or single photo
-  if (key.startsWith('group_')) {
-    const groupData = pendingPhotoGroups.get(key);
-    if (!groupData) {
-      await ctx.reply('❌ Photo data expired. Please send the photos again.');
-      return;
-    }
-    
-    pendingPhotoGroups.delete(key);
-    
-    // Check quota for all photos
-    const photoCount = groupData.photos.length;
-    if (limitCheck.remaining < photoCount) {
-      await ctx.reply(
-        `⚠️ *Not enough quota*\n\n` +
-        `You have ${photoCount} photos but only ${limitCheck.remaining} identifications remaining.\n\n` +
-        `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
-    
-    // Process the media group
-    await processMediaGroup(groupData.photos, chatId, null);
-    
-  } else if (key.startsWith('photo_')) {
-    const photoData = pendingPhotos.get(key);
-    if (!photoData) {
-      await ctx.reply('❌ Photo data expired. Please send the photo again.');
-      return;
-    }
-    
-    pendingPhotos.delete(key);
-    
-    // Create a request for tracking
-    const request = requestManager.createRequest(ctx, { chatId, userId });
-    
-    console.log(`📸 [${request.requestId}] Processing single photo from button (${limitCheck.remaining} requests remaining)`);
-    
-    // Process the photo using stored file_id
-    processSinglePhotoFromFileId(ctx, photoData.fileId, request)
-      .catch(err => {
-        requestManager.updateStatus(request.requestId, 'failed', { error: err });
-        ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
-      });
-  }
 });
 
 /**
@@ -1956,14 +2018,15 @@ async function processSinglePhotoFromFileId(ctx, fileId, request) {
       { parse_mode: 'Markdown' }
     );
     
-    // Store request state for target selection
+    // Store request state for target selection (use same property names as text handler expects)
     const req = requestManager.getRequest(requestId);
     if (req) {
-      req.imageBuffer = buffer;
+      req.buffer = buffer;
       req.exifLocation = exifLocation;
-      req.promptMessageId = promptMsg.message_id;
-      req.awaitingTarget = true;
+      req.promptMsgId = promptMsg.message_id;
+      req.waitingFor = 'target';
       req.chatId = chatId;
+      req.status = 'pending';
     }
     
     console.log(`⏳ [${requestId}] Waiting for target selection...`);
@@ -2165,6 +2228,7 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
  */
 async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget = null) {
   const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
   const validPhotos = processedPhotos.filter(p => !p.error);
   
   if (validPhotos.length === 0) {
@@ -2206,7 +2270,7 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
         });
         
         // Consume rate limit for successful identification
-        rateLimiter.consume(chatId);
+        rateLimiter.consume(chatId, userId);
       } else {
         // Handle quality issues with specific reasons
         const qualityReason = result.data?.reason || result.error || 'Could not identify';
@@ -2479,7 +2543,7 @@ async function processPhotoWithContext(ctx, request, captionTarget = null) {
         // Has EXIF location - process immediately
         console.log(`📍 [${requestId}] Using EXIF location, starting identification...`);
         await processIdentification(ctx, buffer, exifLocation, requestId, captionTarget);
-        const consumed = rateLimiter.consume(ctx.chat.id);
+        const consumed = rateLimiter.consume(ctx.chat.id, ctx.from.id);
         console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
         requestManager.completeAndRemove(requestId);
       } else {
