@@ -57,6 +57,7 @@ async function geocodeLocation(locationName) {
 
 /**
  * Get species info from GBIF by scientific name
+ * Also handles synonyms and returns the accepted/current name
  */
 async function getSpeciesInfo(scientificName) {
   try {
@@ -67,7 +68,7 @@ async function getSpeciesInfo(scientificName) {
     const data = await response.json();
     
     if (data.usageKey) {
-      return {
+      let result = {
         found: true,
         key: data.usageKey,
         scientificName: data.scientificName,
@@ -81,8 +82,46 @@ async function getSpeciesInfo(scientificName) {
         order: data.order,
         family: data.family,
         genus: data.genus,
-        species: data.species
+        species: data.species,
+        isSynonym: false,
+        acceptedName: null,
+        acceptedKey: null
       };
+      
+      // Check if the matched name is a synonym - if so, get the accepted name
+      if (data.status === 'SYNONYM' && data.acceptedUsageKey) {
+        console.log(`   ⚠️ "${speciesName}" is a synonym, fetching accepted name...`);
+        
+        // Fetch the accepted species info
+        const acceptedUrl = `${GBIF_API}/species/${data.acceptedUsageKey}`;
+        const acceptedResponse = await fetch(acceptedUrl);
+        const acceptedData = await acceptedResponse.json();
+        
+        if (acceptedData) {
+          result.isSynonym = true;
+          result.acceptedKey = acceptedData.key;
+          result.acceptedName = acceptedData.canonicalName || acceptedData.scientificName;
+          result.scientificName = acceptedData.scientificName;
+          result.canonicalName = acceptedData.canonicalName;
+          result.key = acceptedData.key;
+          
+          // Also get vernacular names (common names)
+          const vernacularUrl = `${GBIF_API}/species/${acceptedData.key}/vernacularNames`;
+          const vernacularResponse = await fetch(vernacularUrl);
+          const vernacularData = await vernacularResponse.json();
+          
+          // Get English common name
+          if (vernacularData.results) {
+            const englishName = vernacularData.results.find(v => v.language === 'eng' || v.language === 'en');
+            if (englishName) {
+              result.commonName = englishName.vernacularName;
+              console.log(`   ✅ Accepted name: ${result.canonicalName} (${result.commonName})`);
+            }
+          }
+        }
+      }
+      
+      return result;
     }
     return { found: false };
   } catch (error) {

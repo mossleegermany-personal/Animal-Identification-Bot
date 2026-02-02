@@ -100,16 +100,17 @@ function getEBirdUrl(speciesCode) {
 
 /**
  * Verify bird identification with eBird taxonomy
+ * Handles synonyms by also checking common name matches
  * Returns the correct species if found, or indicates mismatch
  */
-async function verifyWithEBird(scientificName) {
+async function verifyWithEBird(scientificName, commonName = null) {
   try {
     const nameParts = scientificName.split(' ');
     const genus = nameParts[0].toLowerCase();
     const species = (nameParts[1] || '').toLowerCase();
     const speciesName = `${nameParts[0]} ${nameParts[1] || ''}`.trim();
     
-    console.log(`   🐦 eBird: Verifying "${speciesName}"...`);
+    console.log(`   🐦 eBird: Verifying "${speciesName}"${commonName ? ` (${commonName})` : ''}...`);
     
     const taxonomy = await getEBirdTaxonomy();
     
@@ -138,14 +139,60 @@ async function verifyWithEBird(scientificName) {
       }
     }
     
-    // Not found in eBird - try fuzzy match by genus
-    console.log(`   ⚠️ eBird: Species "${speciesName}" not found, searching similar...`);
+    // Not found by scientific name - try matching by common name (handles synonyms)
+    if (commonName) {
+      const commonLower = commonName.toLowerCase().replace(/[^a-z\s]/g, '').trim();
+      console.log(`   🔍 eBird: Searching by common name "${commonName}"...`);
+      
+      for (const bird of taxonomy) {
+        const birdComName = (bird.comName || '').toLowerCase().replace(/[^a-z\s]/g, '').trim();
+        
+        // Exact common name match
+        if (birdComName === commonLower) {
+          console.log(`   ✅ eBird: Found by common name - ${bird.sciName} (${bird.comName})`);
+          return {
+            verified: true,
+            found: true,
+            matches: false,  // Scientific name changed
+            speciesCode: bird.speciesCode,
+            commonName: bird.comName,
+            scientificName: bird.sciName,
+            eBirdName: bird.sciName,
+            originalName: speciesName,
+            nameUpdatedReason: 'matched by common name'
+          };
+        }
+      }
+      
+      // Try partial common name match (e.g., "Golden Oriole" in "Eurasian Golden Oriole")
+      for (const bird of taxonomy) {
+        const birdComName = (bird.comName || '').toLowerCase().replace(/[^a-z\s]/g, '').trim();
+        
+        if (birdComName.includes(commonLower) || commonLower.includes(birdComName)) {
+          console.log(`   📝 eBird: Partial common name match - ${bird.sciName} (${bird.comName})`);
+          return {
+            verified: true,
+            found: true,
+            matches: false,
+            speciesCode: bird.speciesCode,
+            commonName: bird.comName,
+            scientificName: bird.sciName,
+            eBirdName: bird.sciName,
+            originalName: speciesName,
+            nameUpdatedReason: 'partial common name match'
+          };
+        }
+      }
+    }
+    
+    // Still not found - try fuzzy match by genus
+    console.log(`   ⚠️ eBird: Species "${speciesName}" not found, searching by genus...`);
     for (const bird of taxonomy) {
       const birdSciName = (bird.sciName || '').toLowerCase();
       const birdGenus = birdSciName.split(' ')[0];
       
       if (birdGenus === genus) {
-        console.log(`   📝 eBird: Found similar - ${bird.sciName} (${bird.comName})`);
+        console.log(`   📝 eBird: Found same genus - ${bird.sciName} (${bird.comName})`);
         return {
           verified: true,
           found: true,
@@ -154,7 +201,8 @@ async function verifyWithEBird(scientificName) {
           commonName: bird.comName,
           scientificName: bird.sciName,
           eBirdName: bird.sciName,
-          originalName: speciesName
+          originalName: speciesName,
+          nameUpdatedReason: 'same genus'
         };
       }
     }

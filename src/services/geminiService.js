@@ -8,29 +8,40 @@ const MODELS = [
   { name: 'gemini-2.0-flash', displayName: 'Gemini 2.0 Flash' },  // Reliable backup
 ];
 
-// Generation config - optimized for speed
+// Generation config - optimized for accuracy
 const GENERATION_CONFIG = {
-  temperature: 0.4,       // Low for accurate results
-  topP: 0.95,             // Default
-  topK: 40,               // Default
+  temperature: 0.2,       // Very low for maximum accuracy
+  topP: 0.9,              // More focused
+  topK: 32,               // More focused
   maxOutputTokens: 4096   // Enough for response
 };
 
-const PROMPT = `You are an expert wildlife biologist and taxonomist. Identify the animal in this image with FULL taxonomic detail.
+const PROMPT = `You are an expert wildlife biologist, ornithologist, and taxonomist with decades of field experience. 
 
-CRITICAL: You MUST attempt to identify the subspecies. For example:
-- Peregrine Falcon has 19 subspecies (anatum, peregrinus, brookei, calidus, etc.)
-- Tigers have 6 subspecies (bengalensis, tigris, altaica, etc.)
-- Lions have subspecies (leo, melanochaita, etc.)
+ANALYZE THIS IMAGE VERY CAREFULLY. Look at:
+1. Body shape, size proportions, and posture
+2. Bill/beak shape, size, and color
+3. Leg length, color, and structure
+4. Wing pattern, length, and shape
+5. Tail shape and length
+6. Plumage/fur colors, patterns, and markings
+7. Eye color, size, and ring patterns
+8. Any distinctive field marks
 
-Analyze visible features like size, coloration, markings, and any geographic clues to determine the most likely subspecies.
+CRITICAL ACCURACY RULES:
+- Only identify to the taxonomic level you are 90%+ CONFIDENT about
+- If you can confidently identify the species but NOT the subspecies, leave subspecies as null
+- If you can only confidently identify the genus, use "Genus sp." format
+- Do NOT guess - accuracy is more important than specificity
+- Consider similar species that could be confused - rule them out explicitly
 
 Return JSON only:
 {
   "identified": true,
+  "identificationLevel": "subspecies/species/genus/family",
   "confidence": 0.95,
-  "commonName": "Common Name",
-  "scientificName": "Genus species subspecies",
+  "commonName": "Common Name (use most specific name you're confident about)",
+  "scientificName": "Full scientific name to the level you're confident (e.g. 'Genus species' or just 'Genus sp.' if species uncertain)",
   "taxonomy": {
     "kingdom": "Animalia",
     "phylum": "",
@@ -39,17 +50,38 @@ Return JSON only:
     "family": "",
     "subfamily": "",
     "genus": "",
-    "species": "",
-    "subspecies": "MUST provide subspecies name based on visible features, or 'Unable to determine from image' if truly impossible"
+    "species": "null if not confident enough to determine",
+    "subspecies": "null if not confident enough to determine, or 'monotypic' if species has no subspecies"
   },
-  "subspeciesReasoning": "Explain why you identified this subspecies or why it cannot be determined",
-  "sex": "Male/Female/Unknown - explain indicators",
+  "confidenceLevels": {
+    "family": 0.99,
+    "genus": 0.95,
+    "species": 0.85,
+    "subspecies": 0.60
+  },
+  "similarSpeciesRuledOut": [
+    "Species Name 1 - reason why ruled out (e.g., different bill shape, lacks eye ring)",
+    "Species Name 2 - reason why ruled out",
+    "Species Name 3 - reason why ruled out"
+  ],
+  "identificationReasoning": "Explain what features you could see clearly and why you stopped at this taxonomic level",
+  "sex": "Male/Female/Unknown - only if clearly visible indicators",
   "lifeStage": "Adult/Juvenile/Immature/Unknown",
-  "morph": "color morph/phase if applicable (melanistic, leucistic, erythristic, etc.) or null",
-  "description": "detailed identifying features",
-  "geographicRange": "where this species/subspecies is typically found",
-  "conservationStatus": "IUCN status"
+  "morph": "color morph/phase if clearly applicable (melanistic, leucistic, erythristic, etc.) or null",
+  "migratoryStatus": "For birds: Resident/Winter Visitor/Summer Visitor/Passage Migrant/Vagrant - based on location and time of year, or null for non-birds (used for analysis only, not displayed)",
+  "description": "detailed identifying features you can see",
+  "geographicRange": "where this species/genus is typically found",
+  "iucnStatus": {
+    "global": "Global IUCN Red List status: LC (Least Concern) / NT (Near Threatened) / VU (Vulnerable) / EN (Endangered) / CR (Critically Endangered) / EW (Extinct in Wild) / EX (Extinct) / DD (Data Deficient) / NE (Not Evaluated)",
+    "local": "Local/national conservation status for the location context if known (e.g., 'Nationally Endangered', 'Protected', 'Locally Threatened'), or null if same as global or unknown"
+  }
 }
+
+IMPORTANT for similarSpeciesRuledOut:
+- List 3-5 species that could be confused with this identification
+- For each, explain the key distinguishing feature that ruled it out
+- Use common names that users would recognize
+- Focus on species found in similar geographic regions
 
 If no animal: {"identified": false, "reason": "why"}`;
 
@@ -59,20 +91,31 @@ async function identifyAnimal(imageBuffer, mimeType = 'image/jpeg', options = {}
   // Add location/country context if provided
   let prompt = PROMPT;
   if (options.location || options.country) {
-    prompt += `\n\n🌍 GEOGRAPHIC CONTEXT (CRITICAL for subspecies identification):`;
+    prompt += `\n\n🌍 GEOGRAPHIC CONTEXT (use to help narrow down identification):`;
     if (options.country) {
       prompt += `\nCountry: ${options.country}`;
     }
     if (options.location) {
       prompt += `\nLocation: ${options.location}`;
     }
-    prompt += `\n\nUse this geographic information to identify the correct SUBSPECIES. Many species have different subspecies in different regions. For example:
-- Tigers in India are Bengal tigers (Panthera tigris tigris)
-- Tigers in Russia are Siberian tigers (Panthera tigris altaica)
-- Leopards in Africa are African leopards (Panthera pardus pardus)
-- Leopards in Asia are different subspecies based on region
+    
+    // Add current date for migratory bird consideration
+    const currentDate = new Date();
+    const month = currentDate.toLocaleString('en-US', { month: 'long' });
+    const year = currentDate.getFullYear();
+    prompt += `\nCurrent Date: ${month} ${year}`;
+    
+    prompt += `\n\n🦅 MIGRATORY BIRDS CONSIDERATION:
+- Consider whether this could be a migratory species passing through or wintering in this location
+- For the given location and time of year, consider:
+  * Resident species (present year-round)
+  * Winter visitors/migrants (typically Oct-Mar in Northern Hemisphere)
+  * Summer breeding visitors (typically Apr-Sep in Northern Hemisphere)
+  * Passage migrants (during spring Mar-May or autumn Aug-Nov)
+- If a species is unlikely to be present at this location during this time of year, mention this in your reasoning
+- Migratory status can help narrow down identification between similar species
 
-PRIORITIZE identifying the subspecies based on this location data.`;
+Use this geographic and temporal information to help identify the species/subspecies, but ONLY if you are confident. Geographic location and season can help narrow down possibilities but should not override visual evidence.`;
   }
 
   let lastError = null;

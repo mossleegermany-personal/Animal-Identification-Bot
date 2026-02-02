@@ -1,11 +1,99 @@
-const { Bot, InputFile } = require('grammy');
+const { Bot, InputFile, InlineKeyboard } = require('grammy');
+const ExifParser = require('exif-parser');
+const sharp = require('sharp');
 const { identifyAnimal } = require('../services/geminiService');
 const { getSpeciesPhoto } = require('../services/inaturalistService');
 const { createCompositeImage } = require('../services/imageService');
 const { getEBirdSpeciesCode, verifyWithEBird } = require('../services/ebirdService');
 const { verifyWithGBIF } = require('../services/gbifService');
 
+// Helper function to check if a URL returns a valid page (not an error page)
+async function isValidUrl(url) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+    
+    const response = await fetch(url, { 
+      method: 'GET', 
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; WildlifeBot/1.0)'
+      }
+    });
+    clearTimeout(timeout);
+    
+    // Check for success status
+    if (!response.ok) return false;
+    
+    // Get HTML content to check for error pages
+    const html = await response.text();
+    const htmlLower = html.toLowerCase();
+    
+    // Check for common error page indicators
+    const errorIndicators = [
+      'page not found',
+      '404',
+      'not found',
+      'does not exist',
+      'no results',
+      'no species found',
+      'species not found',
+      'we couldn\'t find',
+      'sorry, we couldn\'t',
+      'no matching',
+      'error page'
+    ];
+    
+    // Check title for errors
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].toLowerCase() : '';
+    
+    // If title contains error indicators, it's likely an error page
+    if (errorIndicators.some(indicator => title.includes(indicator))) {
+      return false;
+    }
+    
+    // For Wikipedia, check if it's a search/disambiguation page
+    if (url.includes('wikipedia.org')) {
+      if (response.url.includes('search') || 
+          htmlLower.includes('wikipedia does not have an article') ||
+          htmlLower.includes('search results')) {
+        return false;
+      }
+    }
+    
+    // For Singapore Birds, check if species page exists
+    if (url.includes('singaporebirds.com')) {
+      if (htmlLower.includes('page not found') || 
+          htmlLower.includes('no species') ||
+          !htmlLower.includes('<article')) {
+        return false;
+      }
+    }
+    
+    // For eBird, check if species exists
+    if (url.includes('ebird.org/species')) {
+      if (htmlLower.includes('species not found') ||
+          htmlLower.includes('no results')) {
+        return false;
+      }
+    }
+    
+    return true;
+  } catch (e) {
+    console.log(`   URL check failed for ${url}: ${e.message}`);
+    return false;
+  }
+}
+
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
+
+// Enable concurrent request handling - process multiple photos simultaneously
+bot.use(async (ctx, next) => {
+  // Don't await - let requests process in parallel
+  next().catch(err => console.error('Handler error:', err));
+});
 
 // Set up bot commands menu
 bot.api.setMyCommands([
@@ -14,7 +102,7 @@ bot.api.setMyCommands([
   { command: 'clear', description: '🗑️ Clear all chat messages' }
 ]);
 
-// Store pending photos waiting for location
+// Store pending photos waiting for location (keyed by uniqueId = odels
 const pendingPhotos = new Map();
 
 // Start command
@@ -33,7 +121,7 @@ bot.command('help', async (ctx) => {
     `📖 *How to use:*\n\n` +
     `1. Send a photo of an animal\n` +
     `2. Tell me where it was taken\n` +
-    `3. Get detailed identification!\n\n`+
+    `3. Get detailed identification!`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -92,49 +180,304 @@ bot.on('message:text', async (ctx) => {
   }
 });
 
-// Handle photos
-bot.on('message:photo', async (ctx) => {
-  try {
-    // Get the largest photo
-    const photos = ctx.message.photo;
-    const largestPhoto = photos[photos.length - 1];
+// Store last identification results for detail requests (keyed by scientific name so anyone can access)
+const lastIdentifications = new Map();
+
+// Track which users have received the HD image for each species (to avoid sending twice)
+// Key: `${scientificName}_${userId}`, Value: true
+const userReceivedImage = new Map();
+
+// Handle callback queries (button clicks)
+bot.on('callback_query:data', async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  
+  if (data.startsWith('details_')) {
+    const scientificName = data.replace('details_', '').replace(/_/g, ' ');
+    const tappedByUserId = ctx.from.id;  // The user who tapped the button
+    const lastResult = lastIdentifications.get(scientificName);  // Look up by scientific name
     
-    // Download image from Telegram
-    const file = await ctx.api.getFile(largestPhoto.file_id);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    
-    const response = await fetch(fileUrl);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    
-    // Check if caption has location
-    const caption = ctx.message.caption || '';
-    const locationMatch = caption.match(/(?:in|from|at|near|@)\s*([A-Za-z\s,]+)/i);
-    
-    if (locationMatch || caption.length > 2) {
-      // Caption has location - process immediately
-      const location = locationMatch ? locationMatch[1].trim() : caption.trim();
-      await processIdentification(ctx, buffer, location);
-    } else {
-      // No location in caption - ask user
-      const promptMsg = await ctx.reply(
-        `🌍 *Where was this photo taken?*\n\n` +
-        `Reply with location or /skip`,
-        { parse_mode: 'Markdown' }
-      );
+    if (lastResult) {
+      const d = lastResult;
       
-      // Store pending photo with prompt message ID
-      pendingPhotos.set(ctx.from.id, { 
-        buffer, 
-        promptMsgId: promptMsg.message_id,
-        timestamp: Date.now() 
-      });
+      // Build detailed information message
+      let detailsMsg = `📚 *Detailed Information*\n\n`;
+      detailsMsg += `*${d.commonName}*\n`;
+      detailsMsg += `_${d.scientificName}_\n\n`;
+      
+      // Taxonomy
+      detailsMsg += `🏷️ *Taxonomy:*\n`;
+      if (d.taxonomy) {
+        if (d.taxonomy.order) detailsMsg += `Order: ${d.taxonomy.order}\n`;
+        if (d.taxonomy.family) detailsMsg += `Family: ${d.taxonomy.family}\n`;
+        if (d.taxonomy.subfamily) detailsMsg += `Subfamily: ${d.taxonomy.subfamily}\n`;
+        if (d.taxonomy.genus) detailsMsg += `Genus: _${d.taxonomy.genus}_\n`;
+      }
+      detailsMsg += `\n`;
+      
+      // Description
+      if (d.description) {
+        detailsMsg += `📝 *Description:*\n${d.description}\n\n`;
+      }
+      
+      // Geographic range
+      if (d.geographicRange) {
+        detailsMsg += `🌍 *Range:*\n${d.geographicRange}\n\n`;
+      }
+      
+      // Conservation status with colored icons
+      const getIucnCode = (status) => {
+        if (!status) return null;
+        const s = status.toUpperCase();
+        if (s.includes('LC') || s.includes('LEAST CONCERN')) return 'LC';
+        if (s.includes('NT') || s.includes('NEAR THREATENED')) return 'NT';
+        if (s.includes('VU') || s.includes('VULNERABLE')) return 'VU';
+        if (s.includes('EN') && !s.includes('EXTINCT')) return 'EN';
+        if (s.includes('CR') || s.includes('CRITICALLY')) return 'CR';
+        if (s.includes('EW') || s.includes('EXTINCT IN WILD')) return 'EW';
+        if (s.includes('EX') || s.includes('EXTINCT')) return 'EX';
+        if (s.includes('DD') || s.includes('DATA DEFICIENT')) return 'DD';
+        if (s.includes('NE') || s.includes('NOT EVALUATED')) return 'NE';
+        return null;
+      };
+      
+      const getIucnDisplay = (code) => {
+        // Returns colored block + icon + full name - each status distinctly colored
+        const display = {
+          'EX': { icon: '⬛💀', name: 'Extinct' },
+          'EW': { icon: '⬛☠️', name: 'Extinct in the Wild' },
+          'CR': { icon: '🟥🔴', name: 'Critically Endangered' },
+          'EN': { icon: '🟧🟠', name: 'Endangered' },
+          'VU': { icon: '🟨🟡', name: 'Vulnerable' },
+          'NT': { icon: '🟩🟢', name: 'Near Threatened' },
+          'LC': { icon: '🟢✅', name: 'Least Concern' },
+          'DD': { icon: '⬜❓', name: 'Data Deficient' },
+          'NE': { icon: '⚪', name: 'Not Evaluated' }
+        };
+        return display[code] || { icon: '⚪', name: 'Unknown' };
+      };
+      
+      const iucn = d.iucnStatus;
+      const globalStatus = iucn?.global || d.conservationStatus;
+      const globalCode = getIucnCode(globalStatus);
+      
+      detailsMsg += `🛡️ *Conservation Status:*\n\n`;
+      detailsMsg += `*Global (IUCN Red List):*\n`;
+      if (globalCode) {
+        const display = getIucnDisplay(globalCode);
+        detailsMsg += `${display.icon} ${display.name} (IUCN 3.1)\n\n`;
+      } else {
+        detailsMsg += `⚪ Not Evaluated\n\n`;
+      }
+      
+      // Local status
+      detailsMsg += `*Local Status:*\n`;
+      if (iucn && iucn.local && iucn.local !== 'null') {
+        const localCode = getIucnCode(iucn.local);
+        if (localCode) {
+          const display = getIucnDisplay(localCode);
+          detailsMsg += `${display.icon} ${display.name}\n\n`;
+        } else {
+          detailsMsg += `${iucn.local}\n\n`;
+        }
+      } else {
+        detailsMsg += `⚪ Not assessed\n\n`;
+      }
+      
+      // Check if user already received the image (via Similar Species)
+      const imageKey = `${scientificName}_${tappedByUserId}`;
+      const alreadyReceivedImage = userReceivedImage.get(imageKey);
+      
+      // Always PM to user (send with original image only if not already sent)
+      try {
+        let hdBuffer = null;
+        if (!alreadyReceivedImage && d._originalImageBuffer) {
+          console.log(`   🖼️ Processing HD image (${d._originalImageBuffer.length} bytes)...`);
+          // Process image: Full size, natural orientation, high quality JPEG for Telegram
+          hdBuffer = await sharp(d._originalImageBuffer)
+            .rotate()  // Auto-rotate to natural orientation
+            .withMetadata()  // Preserve metadata
+            .jpeg({
+              quality: 100,  // Maximum quality - no loss
+              chromaSubsampling: '4:4:4',  // Best color quality
+              force: false
+            })
+            .toBuffer();
+        }
+        
+        // Always PM the user
+        try {
+          if (hdBuffer) {
+            await ctx.api.sendPhoto(tappedByUserId, new InputFile(hdBuffer, 'photo_hd.jpg'));
+            userReceivedImage.set(imageKey, true);
+          }
+          await ctx.api.sendMessage(tappedByUserId, detailsMsg, { parse_mode: 'Markdown' });
+          await ctx.answerCallbackQuery({ text: '📬 Details sent to PM!' });
+        } catch (pmError) {
+          // Can't PM - user hasn't started chat with bot
+          console.log('Cannot PM user:', pmError.message);
+          const botInfo = await ctx.api.getMe();
+          await ctx.answerCallbackQuery({ 
+            text: `⚠️ Please start a chat with @${botInfo.username} first, then tap again.`,
+            show_alert: true 
+          });
+        }
+      } catch (e) {
+        console.log('Error sending details:', e.message);
+        await ctx.answerCallbackQuery({ text: '❌ Error sending details' });
+      }
+    } else {
+      await ctx.answerCallbackQuery({ text: '❌ Data expired. Please identify again.' });
     }
+  }
+  
+  // Handle "Similar Species" button click
+  if (data.startsWith('similar_')) {
+    const scientificName = data.replace('similar_', '').replace(/_/g, ' ');
+    const tappedByUserId = ctx.from.id;  // The user who tapped the button
+    const lastResult = lastIdentifications.get(scientificName);  // Look up by scientific name
     
-  } catch (error) {
-    console.error('Error receiving photo:', error);
-    await ctx.reply(`❌ Error: ${error.message}`);
+    if (lastResult) {
+      const similarSpecies = lastResult.similarSpeciesRuledOut || [];
+      
+      if (similarSpecies.length > 0) {
+        // Build message with similar species list
+        let similarMsg = `🔍 *Similar Species Considered:*\n\n`;
+        
+        similarSpecies.slice(0, 5).forEach((species, index) => {
+          let speciesInfo;
+          if (typeof species === 'string') {
+            speciesInfo = species;
+          } else if (typeof species === 'object' && species !== null) {
+            const name = species.name || species.species || species.commonName || '';
+            const reason = species.reason || '';
+            speciesInfo = reason ? `${name} - ${reason}` : name;
+          } else {
+            speciesInfo = String(species);
+          }
+          similarMsg += `${index + 1}. ${speciesInfo}\n\n`;
+        });
+        
+        // Check if user already received the image (via More Details)
+        const imageKey = `${scientificName}_${tappedByUserId}`;
+        const alreadyReceivedImage = userReceivedImage.get(imageKey);
+        
+        // Always PM to user (send with original image only if not already sent)
+        try {
+          let hdBuffer = null;
+          if (!alreadyReceivedImage && lastResult._originalImageBuffer) {
+            console.log(`   🖼️ Processing HD image (${lastResult._originalImageBuffer.length} bytes)...`);
+            // Process image: Full size, natural orientation, high quality
+            hdBuffer = await sharp(lastResult._originalImageBuffer)
+              .rotate()  // Auto-rotate to natural orientation
+              .withMetadata()  // Preserve metadata
+              .jpeg({
+                quality: 100,  // Maximum quality - no loss
+                chromaSubsampling: '4:4:4',  // Best color quality
+                force: false
+              })
+              .toBuffer();
+          }
+          
+          // Always PM the user
+          try {
+            if (hdBuffer) {
+              await ctx.api.sendPhoto(tappedByUserId, new InputFile(hdBuffer, 'photo_hd.jpg'));
+              userReceivedImage.set(imageKey, true);
+            }
+            await ctx.api.sendMessage(tappedByUserId, similarMsg, { parse_mode: 'Markdown' });
+            await ctx.answerCallbackQuery({ text: '📬 Similar species sent to PM!' });
+          } catch (pmError) {
+            // Can't PM - user hasn't started chat with bot
+            console.log('Cannot PM user:', pmError.message);
+            const botInfo = await ctx.api.getMe();
+            await ctx.answerCallbackQuery({ 
+              text: `⚠️ Please start a chat with @${botInfo.username} first, then tap again.`,
+              show_alert: true 
+            });
+          }
+        } catch (e) {
+          console.log('Error sending similar species:', e.message);
+          await ctx.answerCallbackQuery({ text: '❌ Error sending similar species' });
+        }
+      } else {
+        await ctx.answerCallbackQuery({ text: 'No similar species data available' });
+      }
+    } else {
+      await ctx.answerCallbackQuery({ text: '❌ Data expired. Please identify again.' });
+    }
   }
 });
+
+// Handle photos - runs in parallel for multiple users
+bot.on('message:photo', async (ctx) => {
+  // Process each photo request independently (non-blocking)
+  handlePhotoMessage(ctx).catch(err => {
+    console.error('Photo handler error:', err);
+    ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
+  });
+});
+
+// Separate async function for photo processing
+async function handlePhotoMessage(ctx) {
+  // Get the largest photo (highest resolution)
+  const photos = ctx.message.photo;
+  const largestPhoto = photos[photos.length - 1];
+  
+  // Download image from Telegram
+  const file = await ctx.api.getFile(largestPhoto.file_id);
+  const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+  
+  const response = await fetch(fileUrl);
+  let buffer = Buffer.from(await response.arrayBuffer());
+  
+  // Extract EXIF GPS coordinates BEFORE any image processing (from original buffer)
+  let exifLocation = null;
+  try {
+    const parser = ExifParser.create(buffer);
+    const exifData = parser.parse();
+    if (exifData.tags && exifData.tags.GPSLatitude && exifData.tags.GPSLongitude) {
+      const lat = exifData.tags.GPSLatitude;
+      const lng = exifData.tags.GPSLongitude;
+      exifLocation = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+      console.log(`📍 Found EXIF GPS: ${exifLocation}`);
+    }
+  } catch (e) {
+    // No EXIF data or parsing failed - ignore
+  }
+  
+  // Process image for analysis: Full size, natural orientation, HD/HQ, no quality loss
+  // Use PNG format internally to preserve full quality (lossless)
+  buffer = await sharp(buffer)
+    .rotate()  // Auto-rotate to natural orientation based on EXIF
+    .withMetadata()  // Preserve all metadata
+    .png({  // Use PNG for lossless quality
+      compressionLevel: 0,  // No compression for fastest processing
+      effort: 1  // Minimal effort for speed
+    })
+    .toBuffer();
+  
+  console.log(`📷 Image processed: Full size, natural orientation, lossless quality`);
+  
+  if (exifLocation) {
+    // Image has GPS coordinates - process immediately
+    await processIdentification(ctx, buffer, exifLocation);
+  } else {
+    // No EXIF GPS - always ask for location (ignore caption)
+    const promptMsg = await ctx.reply(
+      `🌍 *Where was this photo taken?*\n\n` +
+      `Reply with location or /skip`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Store pending photo with prompt message ID
+    pendingPhotos.set(ctx.from.id, { 
+      buffer, 
+      promptMsgId: promptMsg.message_id,
+      timestamp: Date.now() 
+    });
+  }
+}
+
 // Process identification
 async function processIdentification(ctx, buffer, location) {
   let statusMsg;
@@ -156,6 +499,9 @@ async function processIdentification(ctx, buffer, location) {
     
     const d = result.data;
     
+    // Store original image buffer for later PM
+    d._originalImageBuffer = buffer;
+    
     // Check if it's a bird (class Aves)
     const isBird = d.taxonomy?.class?.toLowerCase() === 'aves';
     
@@ -165,79 +511,109 @@ async function processIdentification(ctx, buffer, location) {
     const gbifResult = await verifyWithGBIF(d, location);
     
     // Use GBIF species name if different from Gemini (GBIF takes priority)
-    if (gbifResult.verified && !gbifResult.matches && gbifResult.gbifName) {
-      console.log(`   📝 Using GBIF species: ${gbifResult.gbifName} (Gemini said: ${d.scientificName})`);
-      d.scientificName = gbifResult.gbifName;
-      if (gbifResult.species?.canonicalName) {
-        d.scientificName = gbifResult.species.canonicalName;
+    // This handles taxonomic revisions and synonym updates
+    if (gbifResult.verified) {
+      if (gbifResult.species?.isSynonym && gbifResult.species?.acceptedName) {
+        console.log(`   🔄 Name updated (was synonym): ${d.scientificName} → ${gbifResult.species.acceptedName}`);
+        d.scientificName = gbifResult.species.canonicalName || gbifResult.species.acceptedName;
+        if (gbifResult.species.commonName) {
+          d.commonName = gbifResult.species.commonName;
+          console.log(`   🔄 Common name updated: ${d.commonName}`);
+        }
+      } else if (!gbifResult.matches && gbifResult.gbifName) {
+        console.log(`   📝 Using GBIF species: ${gbifResult.gbifName} (Gemini said: ${d.scientificName})`);
+        d.scientificName = gbifResult.species?.canonicalName || gbifResult.gbifName;
       }
     }
     
-    // Step 3: If bird, also verify with eBird
+    // Step 3: If bird, also verify with eBird (eBird has most current bird taxonomy)
     if (isBird) {
       console.log('\n🐦 Verifying bird with eBird...');
-      const eBirdResult = await verifyWithEBird(d.scientificName);
+      // Pass both scientific name and common name for better synonym resolution
+      const eBirdResult = await verifyWithEBird(d.scientificName, d.commonName);
       
-      // Use eBird species name if different (eBird takes priority for birds)
-      if (eBirdResult.verified && !eBirdResult.matches && eBirdResult.eBirdName) {
-        console.log(`   📝 Using eBird species: ${eBirdResult.eBirdName}`);
-        d.scientificName = eBirdResult.scientificName;
-        if (eBirdResult.commonName) {
-          d.commonName = eBirdResult.commonName;
+      // Use eBird species name - eBird taxonomy is authoritative for birds
+      if (eBirdResult.verified && eBirdResult.found) {
+        if (!eBirdResult.matches || eBirdResult.scientificName !== d.scientificName) {
+          console.log(`   🔄 eBird name update: ${d.scientificName} → ${eBirdResult.scientificName}`);
+          if (eBirdResult.nameUpdatedReason) {
+            console.log(`   📝 Reason: ${eBirdResult.nameUpdatedReason}`);
+          }
         }
+        d.scientificName = eBirdResult.scientificName;
+        d.commonName = eBirdResult.commonName;
+        console.log(`   ✅ Using eBird taxonomy: ${d.scientificName} (${d.commonName})`);
       }
     }
+    
+    // Store identification result AFTER all name updates (keyed by final scientific name)
+    console.log(`   💾 Storing result with key: ${d.scientificName}`);
+    lastIdentifications.set(d.scientificName, d);
     
     // Get iNaturalist reference photo (uses species only)
     console.log('\n📷 Getting iNaturalist reference photo...');
     const iNatPhoto = await getSpeciesPhoto(d.scientificName);
     
-    // Delete status message
-    try {
-      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    } catch (e) {}
-    
     // Generate links - use scientific name (genus + species only)
     const nameParts = d.scientificName.split(' ');
     const genusSpecies = `${nameParts[0]} ${nameParts[1] || ''}`.trim();
     const scientificNameUnderscore = genusSpecies.replace(/\s+/g, '_');
-    const scientificNameHyphen = genusSpecies.toLowerCase().replace(/\s+/g, '-');
     
     // Wikipedia uses scientific name with underscores
     const wikipediaUrl = `https://en.wikipedia.org/wiki/${scientificNameUnderscore}`;
     
     // iNaturalist - use taxa ID format: /taxa/5367-Gyps-himalayensis
-    let iNaturalistUrl;
     const iNatNameHyphen = iNatPhoto.taxonName.replace(/\s+/g, '-');
-    iNaturalistUrl = `https://www.inaturalist.org/taxa/${iNatPhoto.taxonId}-${iNatNameHyphen}`;
+    const iNaturalistUrl = `https://www.inaturalist.org/taxa/${iNatPhoto.taxonId}-${iNatNameHyphen}`;
     
-    // Bird-specific links (isBird already checked earlier)
-    let birdLinks = '';
+    // Validate all links in parallel
+    const linkChecks = [
+      isValidUrl(wikipediaUrl).then(valid => valid ? `[Wikipedia](${wikipediaUrl})` : null),
+      isValidUrl(iNaturalistUrl).then(valid => valid ? `[iNaturalist](${iNaturalistUrl})` : null)
+    ];
+    
+    // Bird-specific links - validate with HTML content check
     if (isBird) {
       // eBird - get species code for direct link
       const eBirdData = await getEBirdSpeciesCode(d.scientificName);
-      const eBirdUrl = eBirdData.found 
-        ? `https://ebird.org/species/${eBirdData.speciesCode}`
-        : `https://ebird.org/explore?q=${encodeURIComponent(genusSpecies)}`;
-      // SingaporeBirds - uses hyphenated lowercase common name
-      const commonNameHyphen = d.commonName.toLowerCase().replace(/\s+/g, '-');
-      const sgBirdsUrl = `https://singaporebirds.com/species/${commonNameHyphen}/`;
-      birdLinks = `\n[eBird](${eBirdUrl}) • [Singapore Birds](${sgBirdsUrl})`;
+      if (eBirdData.found) {
+        const eBirdUrl = `https://ebird.org/species/${eBirdData.speciesCode}`;
+        linkChecks.push(isValidUrl(eBirdUrl).then(valid => valid ? `[eBird](${eBirdUrl})` : null));
+      }
     }
     
-    // Build caption with links
-    const baseLinks = `[Wikipedia](${wikipediaUrl}) • [iNaturalist](${iNaturalistUrl})`;
+    // Wait for all link validations
+    const validLinks = (await Promise.all(linkChecks)).filter(link => link !== null);
+    const linksText = validLinks.join(' • ');
     
-    // Send composite image (photo left, text right with badges)
+    // Delete status message just before sending result
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+    } catch (e) {}
+    
+    // Build buttons for follow-up actions
+    const followUpButtons = [];
+    
+    // Add "More Details" button
+    followUpButtons.push([{ text: '📚 More Details', callback_data: `details_${d.scientificName.replace(/\s+/g, '_')}` }]);
+    
+    // Add "Similar Species" button if there are similar species (for birds only)
+    const similarSpecies = d.similarSpeciesRuledOut || [];
+    if (similarSpecies.length > 0 && isBird) {
+      followUpButtons[0].push({ text: '🔍 Similar Species', callback_data: `similar_${d.scientificName.replace(/\s+/g, '_')}` });
+    }
+    
+    // Send composite image (photo left, text right with badges) with buttons
     if (iNatPhoto.found && iNatPhoto.photoUrl) {
       try {
         const compositeBuffer = await createCompositeImage(iNatPhoto.photoUrl, d);
         
         if (compositeBuffer) {
-          const caption = `${baseLinks}${birdLinks}`;
+          const caption = linksText || '';
           await ctx.replyWithPhoto(new InputFile(compositeBuffer, 'identification.jpg'), {
             caption: caption,
-            parse_mode: 'Markdown'
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: followUpButtons }
           });
         } else {
           // Fallback to regular photo with caption
@@ -248,10 +624,11 @@ async function processIdentification(ctx, buffer, location) {
             subspecies !== 'monotypic' &&
             !subspecies.toLowerCase().includes('unknown');
           const subspeciesText = hasValidSubspecies ? `\n\nSubspecies: _${subspecies}_` : '';
-          const caption = `*${d.commonName}*\n_${d.scientificName}_${subspeciesText}\n\n${baseLinks}${birdLinks}`;
+          const caption = `*${d.commonName}*\n_${d.scientificName}_${subspeciesText}${linksText ? `\n\n${linksText}` : ''}`;
           await ctx.replyWithPhoto(iNatPhoto.photoUrl, { 
             caption: caption,
-            parse_mode: 'Markdown'
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: followUpButtons }
           });
         }
       } catch (e) {
@@ -263,7 +640,10 @@ async function processIdentification(ctx, buffer, location) {
           subspecies !== 'monotypic' &&
           !subspecies.toLowerCase().includes('unknown');
         const subspeciesText = hasValidSubspecies ? `\n\nSubspecies: _${subspecies}_` : '';
-        await ctx.reply(`*${d.commonName}*\n_${d.scientificName}_${subspeciesText}\n\n${baseLinks}${birdLinks}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`*${d.commonName}*\n_${d.scientificName}_${subspeciesText}${linksText ? `\n\n${linksText}` : ''}`, { 
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: followUpButtons }
+        });
       }
     } else {
       // No photo available, send text only
@@ -274,7 +654,10 @@ async function processIdentification(ctx, buffer, location) {
         subspecies !== 'monotypic' &&
         !subspecies.toLowerCase().includes('unknown');
       const subspeciesText = hasValidSubspecies ? `\n\nSubspecies: _${subspecies}_` : '';
-      await ctx.reply(`*${d.commonName}*\n_${d.scientificName}_${subspeciesText}\n\n${baseLinks}${birdLinks}`, { parse_mode: 'Markdown' });
+      await ctx.reply(`*${d.commonName}*\n_${d.scientificName}_${subspeciesText}${linksText ? `\n\n${linksText}` : ''}`, { 
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: followUpButtons }
+      });
     }
     
   } catch (error) {
