@@ -89,6 +89,11 @@ async function isValidUrl(url) {
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
+// Error handler middleware
+bot.catch((err) => {
+  console.error('Bot error:', err.message);
+});
+
 // Bot commands list
 const botCommands = [
   { command: 'start', description: '🦁 Welcome message' },
