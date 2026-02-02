@@ -106,6 +106,15 @@ async function identifyAnimal(imageBuffer, mimeType = 'image/jpeg', options = {}
   
   // Add location/country context if provided
   let prompt = PROMPT;
+  
+  // Add identification target if specified
+  if (options.identifyTarget) {
+    prompt += `\n\n🎯 IDENTIFICATION TARGET:
+The user wants you to specifically identify: "${options.identifyTarget}"
+Focus on this specific subject in the image. If there are multiple animals, identify only the one matching this description.
+If you cannot find what the user described, return: {"identified": false, "reason": "target_not_found", "qualityIssue": "Could not find the specified subject in the image", "suggestion": "Please describe the animal more clearly or send a photo with the subject more visible"}`;
+  }
+  
   if (options.location || options.country) {
     prompt += `\n\n🌍 GEOGRAPHIC CONTEXT (use to help narrow down identification):`;
     if (options.country) {

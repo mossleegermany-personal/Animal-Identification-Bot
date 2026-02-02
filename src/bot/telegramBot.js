@@ -619,6 +619,10 @@ class ResultCache {
 const identificationCache = new ResultCache(300000); // 5 minute TTL (shorter for memory efficiency)
 const userImageCache = new ResultCache(300000); // Track which users received HD images (5 min TTL)
 
+// Temporary storage for photos awaiting identification decision
+const pendingPhotos = new Map(); // For single photos
+const pendingPhotoGroups = new Map(); // For media groups
+
 // Helper function to check if a URL returns a valid page (not an error page)
 async function isValidUrl(url) {
   try {
@@ -767,13 +771,17 @@ bot.command('help', async (ctx) => {
   console.log(`📩 /help command received from user ${ctx.from.id}`);
   await ctx.reply(
     `📖 *How to use:*\n\n` +
-    `1️⃣ Send a photo or multiple photos at once\n` +
-    `2️⃣ Tell me where it was taken (or /skip)\n` +
-    `3️⃣ Get detailed identification!\n\n` +
-    `💡 *Tips:*\n` +
-    `• Send multiple photos together for batch analysis\n` +
-    `• Same species photos will be grouped\n` +
-    `• Use /limit to check your weekly quota`,
+    `*Option 1:* Send photo with caption\n` +
+    `• Caption: /id or /identify\n` +
+    `• Caption: /id the bird on the left\n\n` +
+    `*Option 2:* Reply to any photo\n` +
+    `• Reply with: /identify\n` +
+    `• Reply with: /identify the butterfly\n\n` +
+    `*Commands:*\n` +
+    `/auto - Auto-detect animals\n` +
+    `/skip - Skip location input\n` +
+    `/limit - Check weekly quota\n` +
+    `/clear - Clear chat messages`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -954,6 +962,169 @@ bot.command('clear', async (ctx) => {
   }, 1500);
 });
 
+// Identify command - reply to a photo to identify it
+bot.command('identify', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
+  const replyToMessage = ctx.message.reply_to_message;
+  
+  // Get target from command arguments (e.g., "/identify the bird on the left")
+  const commandText = ctx.message.text || '';
+  const targetFromCommand = commandText.replace(/^\/identify\s*/i, '').trim() || null;
+  
+  // Check if replying to a photo
+  if (!replyToMessage?.photo) {
+    await ctx.reply(
+      `📷 *How to use /identify:*\n\n` +
+      `Reply to a photo with /identify to identify the animal.\n\n` +
+      `*Examples:*\n` +
+      `• Reply with: /identify\n` +
+      `• Reply with: /identify the bird on the left\n` +
+      `• Or send a photo with caption: /id`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  // Check rate limit
+  const limitCheck = rateLimiter.checkLimit(chatId);
+  if (!limitCheck.allowed) {
+    await ctx.reply(
+      `⚠️ *Weekly limit reached*\n\n` +
+      `This group has used all ${limitCheck.limit} identifications for this week.\n\n` +
+      `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
+      `⏳ Time remaining: ${limitCheck.resetIn}`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  // Delete the /identify command
+  try {
+    await ctx.api.deleteMessage(chatId, ctx.message.message_id);
+  } catch (e) {}
+  
+  console.log(`🔍 /identify command on photo in chat ${chatId} by user ${userId}${targetFromCommand ? ` (target: "${targetFromCommand}")` : ''}`);
+  
+  // Create request and process the replied photo
+  const request = requestManager.createRequest(ctx);
+  
+  try {
+    // Get the largest photo
+    const photos = replyToMessage.photo;
+    const largestPhoto = photos[photos.length - 1];
+    
+    // Download image
+    const file = await ctx.api.getFile(largestPhoto.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    const response = await fetch(fileUrl);
+    let buffer = Buffer.from(await response.arrayBuffer());
+    
+    // Extract EXIF GPS
+    let exifLocation = null;
+    try {
+      const parser = ExifParser.create(buffer);
+      const exifData = parser.parse();
+      if (exifData.tags?.GPSLatitude && exifData.tags?.GPSLongitude) {
+        const lat = exifData.tags.GPSLatitude;
+        const lng = exifData.tags.GPSLongitude;
+        exifLocation = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+      }
+    } catch (e) {}
+    
+    // Process image
+    buffer = await sharp(buffer)
+      .rotate()
+      .withMetadata()
+      .png({ compressionLevel: 0, effort: 1 })
+      .toBuffer();
+    
+    // If target provided in command, skip target question
+    if (targetFromCommand) {
+      if (exifLocation) {
+        // Has EXIF - process immediately
+        await processIdentification(ctx, buffer, exifLocation, request.requestId, targetFromCommand);
+        const consumed = rateLimiter.consume(chatId);
+        console.log(`📊 [${request.requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+        requestManager.completeAndRemove(request.requestId);
+      } else {
+        // Ask for location only
+        const promptMsg = await ctx.reply(
+          `🌍 *Where was this photo taken?*\n\n` +
+          `Reply with location or /skip`,
+          { parse_mode: 'Markdown' }
+        );
+        
+        const req = requestManager.getRequest(request.requestId);
+        if (req) {
+          req.buffer = buffer;
+          req.promptMsgId = promptMsg.message_id;
+          req.status = 'pending';
+          req.waitingFor = 'location';
+          req.identifyTarget = targetFromCommand;
+        }
+      }
+    } else if (exifLocation) {
+      // Has EXIF, no target - ask what to identify
+      const promptMsg = await ctx.reply(
+        `🎯 *What would you like me to identify?*\n\n` +
+        `Reply with a description or /auto`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      const req = requestManager.getRequest(request.requestId);
+      if (req) {
+        req.buffer = buffer;
+        req.promptMsgId = promptMsg.message_id;
+        req.exifLocation = exifLocation;
+        req.status = 'pending';
+        req.waitingFor = 'target';
+      }
+    } else {
+      // No EXIF, no target - ask what to identify first
+      const promptMsg = await ctx.reply(
+        `🎯 *What would you like me to identify?*\n\n` +
+        `Reply with a description or /auto`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      const req = requestManager.getRequest(request.requestId);
+      if (req) {
+        req.buffer = buffer;
+        req.promptMsgId = promptMsg.message_id;
+        req.status = 'pending';
+        req.waitingFor = 'target';
+      }
+    }
+  } catch (error) {
+    requestManager.updateStatus(request.requestId, 'failed', { error });
+    requestManager._removeRequest(request.requestId);
+    await ctx.reply(`❌ Error: ${error.message}`);
+  }
+});
+
+// Shortcut command /id - same as /identify
+bot.command('id', async (ctx) => {
+  // Reuse the same logic as /identify
+  const chatId = ctx.chat.id;
+  const replyToMessage = ctx.message.reply_to_message;
+  
+  if (!replyToMessage?.photo) {
+    await ctx.reply(
+      `📷 *How to use /id:*\n\n` +
+      `Reply to a photo with /id to identify the animal.\n\n` +
+      `Or send a photo with caption: /id`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  // Forward to identify command logic by creating a fake context
+  ctx.message.text = ctx.message.text.replace(/^\/id/, '/identify');
+  await bot.handleUpdate({ message: ctx.message, update_id: Date.now() });
+});
+
 // Skip location command - process without location
 bot.command('skip', async (ctx) => {
   const userId = ctx.from.id;
@@ -973,13 +1144,13 @@ bot.command('skip', async (ctx) => {
   const isMediaGroup = pendingRequest.isMediaGroup;
   const processedPhotos = pendingRequest.processedPhotos;
   const statusMsgId = pendingRequest.statusMsgId;
+  const waitingFor = pendingRequest.waitingFor;
+  const identifyTarget = pendingRequest.identifyTarget;
+  const exifLocation = pendingRequest.exifLocation;
   
-  console.log(`⏭️ [${requestId}] Skip location in chat ${chatId}${isMediaGroup ? ' (media group)' : ''}`);
+  console.log(`⏭️ [${requestId}] Skip ${waitingFor || 'location'} in chat ${chatId}${isMediaGroup ? ' (media group)' : ''}`);
   
-  // Update status to processing
-  requestManager.updateStatus(requestId, 'processing');
-  
-  // Delete the location prompt message
+  // Delete the prompt message
   try {
     await ctx.api.deleteMessage(chatId, pendingPromptMsgId);
   } catch (e) {}
@@ -987,6 +1158,43 @@ bot.command('skip', async (ctx) => {
   try {
     await ctx.api.deleteMessage(chatId, ctx.message.message_id);
   } catch (e) {}
+  
+  // If waiting for target, skip to location question (or process if has EXIF)
+  if (waitingFor === 'target') {
+    const req = requestManager.getRequest(requestId);
+    if (req) {
+      req.identifyTarget = null; // Auto-detect
+      
+      if (exifLocation) {
+        // Has EXIF location - process immediately
+        requestManager.updateStatus(requestId, 'processing');
+        try {
+          await processIdentification(ctx, pendingBuffer, exifLocation, requestId, null);
+          const consumed = rateLimiter.consume(chatId);
+          console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+          requestManager.completeAndRemove(requestId);
+        } catch (error) {
+          requestManager.updateStatus(requestId, 'failed', { error });
+          requestManager._removeRequest(requestId);
+          await ctx.reply(`❌ Error: ${error.message}`);
+        }
+      } else {
+        // Ask for location
+        const promptMsg = await ctx.reply(
+          `🌍 *Where was this photo taken?*\n\n` +
+          `Reply with location or /skip`,
+          { parse_mode: 'Markdown' }
+        );
+        req.promptMsgId = promptMsg.message_id;
+        req.waitingFor = 'location';
+      }
+    }
+    return;
+  }
+  
+  // Update status to processing
+  requestManager.updateStatus(requestId, 'processing');
+  
   // Delete status message for media groups
   if (statusMsgId) {
     try {
@@ -1000,7 +1208,7 @@ bot.command('skip', async (ctx) => {
   if (isMediaGroup && processedPhotos) {
     // Process media group without location
     try {
-      await processMediaGroupPhotos(ctx, processedPhotos, noLocation, requestId);
+      await processMediaGroupPhotos(ctx, processedPhotos, noLocation, requestId, identifyTarget);
     } catch (error) {
       requestManager.updateStatus(requestId, 'failed', { error });
       requestManager._removeRequest(requestId);
@@ -1009,7 +1217,7 @@ bot.command('skip', async (ctx) => {
   } else if (pendingBuffer) {
     // Process single photo without location
     try {
-      await processIdentification(ctx, pendingBuffer, noLocation, requestId);
+      await processIdentification(ctx, pendingBuffer, noLocation, requestId, identifyTarget);
       // Consume rate limit on successful completion
       const consumed = rateLimiter.consume(chatId);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
@@ -1026,7 +1234,65 @@ bot.command('skip', async (ctx) => {
   }
 });
 
-// Handle text messages (for location input)
+// Auto command - skip target selection and identify automatically
+bot.command('auto', async (ctx) => {
+  const userId = ctx.from.id;
+  const chatId = ctx.chat.id;
+  
+  const pendingRequest = requestManager.findPendingRequest(userId, chatId);
+  
+  if (!pendingRequest) {
+    await ctx.reply('❌ No pending identification request.');
+    return;
+  }
+  
+  // Only works when waiting for target
+  if (pendingRequest.waitingFor !== 'target') {
+    await ctx.reply('❌ Use /skip to skip location input.');
+    return;
+  }
+  
+  const requestId = pendingRequest.requestId;
+  
+  // Delete prompt and command
+  try {
+    await ctx.api.deleteMessage(chatId, pendingRequest.promptMsgId);
+  } catch (e) {}
+  try {
+    await ctx.api.deleteMessage(chatId, ctx.message.message_id);
+  } catch (e) {}
+  
+  const req = requestManager.getRequest(requestId);
+  if (req) {
+    req.identifyTarget = null; // Auto-detect
+    
+    if (req.exifLocation) {
+      // Has EXIF location - process immediately
+      requestManager.updateStatus(requestId, 'processing');
+      try {
+        await processIdentification(ctx, req.buffer, req.exifLocation, requestId, null);
+        const consumed = rateLimiter.consume(chatId);
+        console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+        requestManager.completeAndRemove(requestId);
+      } catch (error) {
+        requestManager.updateStatus(requestId, 'failed', { error });
+        requestManager._removeRequest(requestId);
+        await ctx.reply(`❌ Error: ${error.message}`);
+      }
+    } else {
+      // Ask for location
+      const promptMsg = await ctx.reply(
+        `🌍 *Where was this photo taken?*\n\n` +
+        `Reply with location or /skip`,
+        { parse_mode: 'Markdown' }
+      );
+      req.promptMsgId = promptMsg.message_id;
+      req.waitingFor = 'location';
+    }
+  }
+});
+
+// Handle text messages (for target and location input)
 bot.on('message:text', async (ctx) => {
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
@@ -1036,7 +1302,62 @@ bot.on('message:text', async (ctx) => {
   
   if (pendingRequest) {
     const requestId = pendingRequest.requestId;
-    const location = ctx.message.text.trim();
+    const userInput = ctx.message.text.trim();
+    
+    // Delete user's message
+    try {
+      await ctx.api.deleteMessage(chatId, ctx.message.message_id);
+    } catch (e) {}
+    
+    // Check what we're waiting for
+    if (pendingRequest.waitingFor === 'target') {
+      // User is providing what to identify
+      console.log(`🎯 [${requestId}] Target received in chat ${chatId}: "${userInput}"`);
+      
+      // Delete the target prompt message
+      try {
+        await ctx.api.deleteMessage(chatId, pendingRequest.promptMsgId);
+      } catch (e) {}
+      
+      // Store the identification target
+      const req = requestManager.getRequest(requestId);
+      if (req) {
+        req.identifyTarget = userInput;
+        
+        // Check if we already have EXIF location
+        if (req.exifLocation) {
+          // Has location - process immediately
+          console.log(`📍 [${requestId}] Using EXIF location, starting identification...`);
+          requestManager.updateStatus(requestId, 'processing');
+          
+          try {
+            await processIdentification(ctx, req.buffer, req.exifLocation, requestId, req.identifyTarget);
+            const consumed = rateLimiter.consume(chatId);
+            console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+            requestManager.completeAndRemove(requestId);
+          } catch (error) {
+            requestManager.updateStatus(requestId, 'failed', { error });
+            requestManager._removeRequest(requestId);
+            await ctx.reply(`❌ Error: ${error.message}`);
+          }
+        } else {
+          // No EXIF - now ask for location
+          const promptMsg = await ctx.reply(
+            `🌍 *Where was this photo taken?*\n\n` +
+            `Reply with location or /skip`,
+            { parse_mode: 'Markdown' }
+          );
+          
+          req.promptMsgId = promptMsg.message_id;
+          req.waitingFor = 'location';
+          console.log(`⏳ [${requestId}] Now waiting for location input...`);
+        }
+      }
+      return;
+    }
+    
+    // Otherwise, user is providing location
+    const location = userInput;
     
     // Capture values locally to ensure correct context
     const pendingBuffer = pendingRequest.buffer;
@@ -1044,6 +1365,7 @@ bot.on('message:text', async (ctx) => {
     const isMediaGroup = pendingRequest.isMediaGroup;
     const processedPhotos = pendingRequest.processedPhotos;
     const statusMsgId = pendingRequest.statusMsgId;
+    const identifyTarget = pendingRequest.identifyTarget;
     
     console.log(`📍 [${requestId}] Location received in chat ${chatId}: "${location}"${isMediaGroup ? ' (media group)' : ''}`);
     
@@ -1053,10 +1375,6 @@ bot.on('message:text', async (ctx) => {
     // Delete the location prompt message
     try {
       await ctx.api.deleteMessage(chatId, pendingPromptMsgId);
-    } catch (e) {}
-    // Delete user's location reply
-    try {
-      await ctx.api.deleteMessage(chatId, ctx.message.message_id);
     } catch (e) {}
     // Delete status message for media groups
     if (statusMsgId) {
@@ -1069,7 +1387,7 @@ bot.on('message:text', async (ctx) => {
     if (isMediaGroup && processedPhotos) {
       // Process media group with location
       try {
-        await processMediaGroupPhotos(ctx, processedPhotos, location, requestId);
+        await processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget);
       } catch (error) {
         requestManager.updateStatus(requestId, 'failed', { error });
         requestManager._removeRequest(requestId);
@@ -1078,7 +1396,7 @@ bot.on('message:text', async (ctx) => {
     } else {
       // Process single photo with captured context
       try {
-        await processIdentification(ctx, pendingBuffer, location, requestId);
+        await processIdentification(ctx, pendingBuffer, location, requestId, identifyTarget);
         // Consume rate limit on successful completion
         const consumed = rateLimiter.consume(chatId);
         console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
@@ -1397,83 +1715,362 @@ const mediaGroupCollector = new MediaGroupCollector();
 
 // ============================================
 // PHOTO MESSAGE HANDLER
-// Creates isolated request context for each photo
-// Supports both single photos and media groups
+// When a photo is uploaded, ask if user wants to identify it
+// Also supports replying to any photo with /identify
 // ============================================
 
 bot.on('message:photo', async (ctx) => {
   const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
+  const messageId = ctx.message.message_id;
   const mediaGroupId = ctx.message.media_group_id;
   
-  // Check rate limit BEFORE processing
-  const limitCheck = rateLimiter.checkLimit(chatId);
-  
-  if (!limitCheck.allowed) {
-    // Only show message once per media group or for single photos
-    if (!mediaGroupId) {
-      console.log(`⚠️ Rate limit exceeded for chat ${chatId} (${limitCheck.used}/${limitCheck.limit})`);
-      await ctx.reply(
-        `⚠️ *Weekly limit reached*\n\n` +
-        `This group has used all ${limitCheck.limit} identifications for this week.\n\n` +
-        `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
-        `⏳ Time remaining: ${limitCheck.resetIn}`,
-        { parse_mode: 'Markdown' }
-      );
-    }
-    return;
-  }
-  
-  // Handle media group (multiple photos)
+  // For media groups, only show prompt once (on first photo)
   if (mediaGroupId) {
     const collectedPhotos = await mediaGroupCollector.addPhoto(mediaGroupId, ctx);
     
     if (collectedPhotos) {
-      // This is the callback after all photos are collected
-      // Check if we have enough quota for all photos
+      // All photos collected - show identification prompt
       const photoCount = collectedPhotos.length;
       
-      if (limitCheck.remaining < photoCount) {
-        await ctx.reply(
-          `⚠️ *Not enough quota*\n\n` +
-          `You sent ${photoCount} photos but only have ${limitCheck.remaining} identifications remaining.\n\n` +
-          `Please send fewer photos or wait for reset.\n` +
-          `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}`,
-          { parse_mode: 'Markdown' }
-        );
+      // Check rate limit first
+      const limitCheck = rateLimiter.checkLimit(chatId);
+      if (!limitCheck.allowed) {
+        // Don't show prompt if rate limited
+        console.log(`📷 ${photoCount} photos shared in chat ${chatId} (rate limited)`);
         return;
       }
       
-      console.log(`📸 Processing media group with ${photoCount} photos (${limitCheck.remaining} remaining)`);
+      // Store collected photos temporarily for later processing
+      const groupKey = `group_${chatId}_${userId}_${Date.now()}`;
+      pendingPhotoGroups.set(groupKey, {
+        photos: collectedPhotos,
+        chatId,
+        userId,
+        timestamp: Date.now(),
+      });
       
-      // Process all photos in the group
-      await processMediaGroup(collectedPhotos, chatId);
+      // Auto-expire after 5 minutes
+      setTimeout(() => pendingPhotoGroups.delete(groupKey), 5 * 60 * 1000);
+      
+      // Show prompt with buttons
+      await ctx.reply(
+        `📸 *${photoCount} photo${photoCount > 1 ? 's' : ''} received!*\n\n` +
+        `Would you like me to identify the animals?`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ Yes, identify', callback_data: `id_yes_${groupKey}` },
+              { text: '❌ No thanks', callback_data: `id_no_${groupKey}` }
+            ]]
+          }
+        }
+      );
+      
+      console.log(`📷 ${photoCount} photos shared in chat ${chatId} - awaiting identification decision`);
     }
-    // If null, this photo was added to existing group and will be processed later
     return;
   }
   
-  // Single photo - process normally
-  const request = requestManager.createRequest(ctx);
+  // Single photo - check rate limit first
+  const limitCheck = rateLimiter.checkLimit(chatId);
+  if (!limitCheck.allowed) {
+    // Don't show prompt if rate limited
+    console.log(`📷 Photo shared in chat ${chatId} (rate limited)`);
+    return;
+  }
   
-  console.log(`📸 [${request.requestId}] New photo from user ${ctx.from.id} (${limitCheck.remaining} requests remaining this week)`);
+  // Get the largest photo (highest resolution)
+  const photos = ctx.message.photo;
+  const largestPhoto = photos[photos.length - 1];
   
-  // Fire and forget - process independently
-  processPhotoWithContext(ctx, request)
-    .catch(err => {
-      requestManager.updateStatus(request.requestId, 'failed', { error: err });
-      ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
-    });
+  // Store photo info temporarily for later processing (include photo file_id)
+  const photoKey = `photo_${chatId}_${userId}_${messageId}`;
+  pendingPhotos.set(photoKey, {
+    messageId,
+    chatId,
+    userId,
+    fileId: largestPhoto.file_id,
+    timestamp: Date.now(),
+  });
+  
+  // Auto-expire after 5 minutes
+  setTimeout(() => pendingPhotos.delete(photoKey), 5 * 60 * 1000);
+  
+  // Show prompt with buttons
+  await ctx.reply(
+    `📸 *Photo received!*\n\n` +
+    `Would you like me to identify the animal?`,
+    {
+      parse_mode: 'Markdown',
+      reply_to_message_id: messageId,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Yes, identify', callback_data: `id_yes_${photoKey}` },
+          { text: '❌ No thanks', callback_data: `id_no_${photoKey}` }
+        ]]
+      }
+    }
+  );
+  
+  console.log(`📷 Photo shared in chat ${chatId} by user ${userId} - awaiting identification decision`);
 });
+
+// Handle identification decision buttons (Yes/No)
+bot.callbackQuery(/^id_(yes|no)_(.+)$/, async (ctx) => {
+  const match = ctx.callbackQuery.data.match(/^id_(yes|no)_(.+)$/);
+  if (!match) return;
+  
+  const decision = match[1]; // 'yes' or 'no'
+  const key = match[2]; // photo or group key
+  const chatId = ctx.callbackQuery.message?.chat?.id;
+  const userId = ctx.from.id;
+  
+  // Delete the prompt message
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {}
+  
+  await ctx.answerCallbackQuery();
+  
+  if (decision === 'no') {
+    // User declined identification - clean up
+    pendingPhotos.delete(key);
+    pendingPhotoGroups.delete(key);
+    console.log(`📷 User ${userId} declined identification in chat ${chatId}`);
+    return;
+  }
+  
+  // User wants identification
+  console.log(`✅ User ${userId} requested identification in chat ${chatId}`);
+  
+  // Check rate limit
+  const limitCheck = rateLimiter.checkLimit(chatId);
+  if (!limitCheck.allowed) {
+    await ctx.reply(
+      `⚠️ *Weekly limit reached*\n\n` +
+      `This group has used all ${limitCheck.limit} identifications for this week.\n\n` +
+      `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}\n` +
+      `⏳ Time remaining: ${limitCheck.resetIn}`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  // Check if it's a photo group or single photo
+  if (key.startsWith('group_')) {
+    const groupData = pendingPhotoGroups.get(key);
+    if (!groupData) {
+      await ctx.reply('❌ Photo data expired. Please send the photos again.');
+      return;
+    }
+    
+    pendingPhotoGroups.delete(key);
+    
+    // Check quota for all photos
+    const photoCount = groupData.photos.length;
+    if (limitCheck.remaining < photoCount) {
+      await ctx.reply(
+        `⚠️ *Not enough quota*\n\n` +
+        `You have ${photoCount} photos but only ${limitCheck.remaining} identifications remaining.\n\n` +
+        `🔄 Resets: ${rateLimiter.getResetTimeFormatted(chatId)}`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    // Process the media group
+    await processMediaGroup(groupData.photos, chatId, null);
+    
+  } else if (key.startsWith('photo_')) {
+    const photoData = pendingPhotos.get(key);
+    if (!photoData) {
+      await ctx.reply('❌ Photo data expired. Please send the photo again.');
+      return;
+    }
+    
+    pendingPhotos.delete(key);
+    
+    // Create a request for tracking
+    const request = requestManager.createRequest(ctx, { chatId, userId });
+    
+    console.log(`📸 [${request.requestId}] Processing single photo from button (${limitCheck.remaining} requests remaining)`);
+    
+    // Process the photo using stored file_id
+    processSinglePhotoFromFileId(ctx, photoData.fileId, request)
+      .catch(err => {
+        requestManager.updateStatus(request.requestId, 'failed', { error: err });
+        ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
+      });
+  }
+});
+
+/**
+ * Process a single photo from file_id (used by button callback)
+ * @param {Context} ctx - grammy context
+ * @param {string} fileId - Telegram file ID
+ * @param {Object} request - Request object from RequestManager
+ */
+async function processSinglePhotoFromFileId(ctx, fileId, request) {
+  const { requestId } = request;
+  const chatId = ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
+  
+  try {
+    requestManager.updateStatus(requestId, 'processing');
+    
+    // Download image from Telegram
+    console.log(`📥 [${requestId}] Downloading image...`);
+    const file = await ctx.api.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    const response = await fetch(fileUrl);
+    let buffer = Buffer.from(await response.arrayBuffer());
+    
+    // Extract EXIF GPS coordinates BEFORE any image processing
+    let exifLocation = null;
+    try {
+      const parser = ExifParser.create(buffer);
+      const exifData = parser.parse();
+      if (exifData.tags && exifData.tags.GPSLatitude && exifData.tags.GPSLongitude) {
+        const lat = exifData.tags.GPSLatitude;
+        const lng = exifData.tags.GPSLongitude;
+        exifLocation = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+        console.log(`📍 [${requestId}] Found EXIF GPS: ${exifLocation}`);
+      }
+    } catch (e) {}
+    
+    // Process image for analysis
+    console.log(`🖼️ [${requestId}] Processing image...`);
+    buffer = await sharp(buffer)
+      .rotate()
+      .withMetadata()
+      .png({ compressionLevel: 0, effort: 1 })
+      .toBuffer();
+    
+    // Ask what to identify
+    const promptMsg = await ctx.reply(
+      `🎯 *What would you like me to identify?*\n\n` +
+      `• Reply with what you want identified (e.g., "the bird on the left")\n` +
+      `• Or use /auto to identify all animals`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Store request state for target selection
+    const req = requestManager.getRequest(requestId);
+    if (req) {
+      req.imageBuffer = buffer;
+      req.exifLocation = exifLocation;
+      req.promptMessageId = promptMsg.message_id;
+      req.awaitingTarget = true;
+      req.chatId = chatId;
+    }
+    
+    console.log(`⏳ [${requestId}] Waiting for target selection...`);
+    
+  } catch (error) {
+    console.error(`❌ [${requestId}] Error:`, error.message);
+    requestManager.completeAndRemove(requestId);
+    throw error;
+  }
+}
 
 /**
  * Process a media group (multiple photos)
  * @param {MediaGroupPhoto[]} photos - Array of collected photos
  * @param {number} chatId - Chat ID
+ * @param {string} [captionTarget] - What to identify from caption
  */
-async function processMediaGroup(photos, chatId) {
+async function processMediaGroup(photos, chatId, captionTarget = null) {
   const firstCtx = photos[0].ctx;
   const photoCount = photos.length;
   
+  // If target provided in caption, skip the "what to identify" question
+  if (captionTarget) {
+    // Send initial status message
+    const statusMsg = await firstCtx.reply(
+      `📸 *Processing ${photoCount} photo${photoCount > 1 ? 's' : ''}...*\n\n` +
+      `🎯 Looking for: ${captionTarget}`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Ask for location
+    const promptMsg = await firstCtx.reply(
+      `🌍 *Where were these photos taken?*\n\n` +
+      `Reply with location or /skip`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Store as pending request
+    const groupRequest = requestManager.createRequest(firstCtx, {
+      isMediaGroup: true,
+      photoCount,
+    });
+    
+    // Download and process all images in parallel (same as before)
+    const processedPhotos = await Promise.all(photos.map(async (photoData, index) => {
+      try {
+        const file = await firstCtx.api.getFile(photoData.photo.file_id);
+        const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+        
+        const response = await fetch(fileUrl);
+        let buffer = Buffer.from(await response.arrayBuffer());
+        
+        // Extract EXIF GPS if available
+        let exifLocation = null;
+        try {
+          const parser = ExifParser.create(buffer);
+          const exifData = parser.parse();
+          if (exifData.tags?.GPSLatitude && exifData.tags?.GPSLongitude) {
+            const lat = exifData.tags.GPSLatitude;
+            const lng = exifData.tags.GPSLongitude;
+            exifLocation = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+          }
+        } catch (e) {}
+        
+        // Process image
+        buffer = await sharp(buffer)
+          .rotate()
+          .withMetadata()
+          .png({ compressionLevel: 0, effort: 1 })
+          .toBuffer();
+        
+        return { buffer, exifLocation, index };
+      } catch (error) {
+        console.error(`Error processing photo ${index + 1}:`, error.message);
+        return { error: error.message, index };
+      }
+    }));
+    
+    // Check for EXIF location
+    const exifLocation = processedPhotos.find(p => p.exifLocation)?.exifLocation;
+    
+    if (exifLocation) {
+      // Has EXIF - delete prompts and process
+      try {
+        await firstCtx.api.deleteMessage(chatId, statusMsg.message_id);
+        await firstCtx.api.deleteMessage(chatId, promptMsg.message_id);
+      } catch (e) {}
+      
+      await processMediaGroupPhotos(firstCtx, processedPhotos, exifLocation, groupRequest.requestId, captionTarget);
+    } else {
+      // No EXIF - wait for location
+      const req = requestManager.getRequest(groupRequest.requestId);
+      if (req) {
+        req.processedPhotos = processedPhotos;
+        req.promptMsgId = promptMsg.message_id;
+        req.statusMsgId = statusMsg.message_id;
+        req.isMediaGroup = true;
+        req.buffer = true;
+        req.status = 'pending';
+        req.waitingFor = 'location';
+        req.identifyTarget = captionTarget;
+      }
+    }
+    return;
+  }
+  
+  // No caption target - ask what to identify first
   // Send initial status message
   const statusMsg = await firstCtx.reply(
     `📸 *Processing ${photoCount} photo${photoCount > 1 ? 's' : ''}...*\n\n` +
@@ -1481,10 +2078,10 @@ async function processMediaGroup(photos, chatId) {
     { parse_mode: 'Markdown' }
   );
   
-  // Ask for location (use first photo's context)
+  // Ask what to identify
   const promptMsg = await firstCtx.reply(
-    `🌍 *Where were these photos taken?*\n\n` +
-    `Reply with location or /skip`,
+    `🎯 *What would you like me to identify?*\n\n` +
+    `Reply with a description or /auto`,
     { parse_mode: 'Markdown' }
   );
   
@@ -1564,8 +2161,9 @@ async function processMediaGroup(photos, chatId) {
  * @param {Array} processedPhotos - Array of processed photo data
  * @param {string} location - Location string
  * @param {string} requestId - Request ID
+ * @param {string} [identifyTarget] - What to identify in the photos
  */
-async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId) {
+async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget = null) {
   const chatId = ctx.chat.id;
   const validPhotos = processedPhotos.filter(p => !p.error);
   
@@ -1597,7 +2195,7 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
       ).catch(() => {});
       
       // Identify the animal
-      const result = await identifyAnimal(photo.buffer, 'image/jpeg', { location });
+      const result = await identifyAnimal(photo.buffer, 'image/jpeg', { location, identifyTarget });
       
       if (result.success && result.data.identified) {
         results.push({
@@ -1762,7 +2360,8 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
     // Group failures by reason type
     const qualityIssues = failed.filter(f => ['low_resolution', 'obstructed', 'too_distant', 'poor_quality'].includes(f.reason));
     const noAnimal = failed.filter(f => f.reason === 'no_animal');
-    const otherFails = failed.filter(f => !['low_resolution', 'obstructed', 'too_distant', 'poor_quality', 'no_animal'].includes(f.reason));
+    const targetNotFound = failed.filter(f => f.reason === 'target_not_found');
+    const otherFails = failed.filter(f => !['low_resolution', 'obstructed', 'too_distant', 'poor_quality', 'no_animal', 'target_not_found'].includes(f.reason));
     
     let failMsg = '';
     
@@ -1794,6 +2393,12 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
       }
     }
     
+    if (targetNotFound.length > 0) {
+      if (failMsg) failMsg += '\n\n';
+      failMsg += `🔍 ${targetNotFound.length} photo${targetNotFound.length > 1 ? 's' : ''}: Could not find the specified subject.`;
+      failMsg += `\n💡 *Tip:* Try describing the animal differently or use /auto next time.`;
+    }
+    
     if (noAnimal.length > 0) {
       if (failMsg) failMsg += '\n\n';
       failMsg += `🚫 ${noAnimal.length} photo${noAnimal.length > 1 ? 's' : ''} did not contain identifiable animals.`;
@@ -1819,8 +2424,9 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
  * Process photo with request context and timeout
  * @param {Object} ctx - Grammy context
  * @param {RequestContext} request - Request context
+ * @param {string} [captionTarget] - What to identify from caption
  */
-async function processPhotoWithContext(ctx, request) {
+async function processPhotoWithContext(ctx, request, captionTarget = null) {
   const { requestId } = request;
   
   try {
@@ -1865,12 +2471,41 @@ async function processPhotoWithContext(ctx, request) {
       })
       .toBuffer();
     
-    if (exifLocation) {
-      // Image has GPS coordinates - ask what to identify, then process
+    // If target was provided in caption, skip the "what to identify" question
+    if (captionTarget) {
+      console.log(`🎯 [${requestId}] Target from caption: "${captionTarget}"`);
+      
+      if (exifLocation) {
+        // Has EXIF location - process immediately
+        console.log(`📍 [${requestId}] Using EXIF location, starting identification...`);
+        await processIdentification(ctx, buffer, exifLocation, requestId, captionTarget);
+        const consumed = rateLimiter.consume(ctx.chat.id);
+        console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+        requestManager.completeAndRemove(requestId);
+      } else {
+        // No EXIF - ask for location only
+        const promptMsg = await ctx.reply(
+          `🌍 *Where was this photo taken?*\n\n` +
+          `Reply with location or /skip`,
+          { parse_mode: 'Markdown' }
+        );
+        
+        const req = requestManager.getRequest(requestId);
+        if (req) {
+          req.buffer = buffer;
+          req.promptMsgId = promptMsg.message_id;
+          req.status = 'pending';
+          req.waitingFor = 'location';
+          req.identifyTarget = captionTarget;
+          console.log(`⏳ [${requestId}] Waiting for location input...`);
+        }
+      }
+    } else if (exifLocation) {
+      // No caption target, but has GPS - ask what to identify
       console.log(`📍 [${requestId}] Has EXIF location, asking what to identify...`);
       const promptMsg = await ctx.reply(
         `🎯 *What would you like me to identify?*\n\n` +
-        `Reply with a description (e.g., "the bird on the left", "the butterfly", "all animals")\n` +
+        `Reply with a description (e.g., "the bird on the left", "the butterfly")\n` +
         `Or /auto to identify automatically`,
         { parse_mode: 'Markdown' }
       );
@@ -1886,11 +2521,11 @@ async function processPhotoWithContext(ctx, request) {
         console.log(`⏳ [${requestId}] Waiting for identification target...`);
       }
     } else {
-      // No EXIF GPS - ask what to identify first, then location
+      // No caption target, no EXIF - ask what to identify first
       console.log(`📍 [${requestId}] No EXIF GPS, asking what to identify...`);
       const promptMsg = await ctx.reply(
         `🎯 *What would you like me to identify?*\n\n` +
-        `Reply with a description (e.g., "the bird on the left", "the butterfly", "all animals")\n` +
+        `Reply with a description (e.g., "the bird on the left", "the butterfly")\n` +
         `Or /auto to identify automatically`,
         { parse_mode: 'Markdown' }
       );
@@ -1923,8 +2558,9 @@ async function processPhotoWithContext(ctx, request) {
  * @param {Buffer} buffer - Image buffer
  * @param {string} location - Location string
  * @param {string} [requestId] - Request ID for logging
+ * @param {string} [identifyTarget] - What to identify in the image
  */
-async function processIdentification(ctx, buffer, location, requestId = 'unknown') {
+async function processIdentification(ctx, buffer, location, requestId = 'unknown', identifyTarget = null) {
   let statusMsg;
   const logPrefix = `[${requestId}]`;
   
@@ -1938,7 +2574,10 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
 
     // Step 1: Identify with Gemini 2.5 Pro
     console.log(`\n🤖 ${logPrefix} Starting Gemini 2.5 Pro analysis...`);
-    const result = await identifyAnimal(buffer, 'image/jpeg', { location });
+    if (identifyTarget) {
+      console.log(`   🎯 Target: "${identifyTarget}"`);
+    }
+    const result = await identifyAnimal(buffer, 'image/jpeg', { location, identifyTarget });
     
     if (!result.success || !result.data.identified) {
       await ctx.api.deleteMessage(targetChatId, statusMsg.message_id);
@@ -1955,7 +2594,8 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
         'obstructed': '🌿',
         'too_distant': '🔭',
         'poor_quality': '📷',
-        'no_animal': '🚫'
+        'no_animal': '🚫',
+        'target_not_found': '🔍'
       };
       
       const icon = issueIcons[reason] || '❌';
@@ -1972,6 +2612,8 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
         errorMsg = `${icon} *Poor Image Quality*\n\nThe image is too dark, blurry, or overexposed for identification.`;
       } else if (reason === 'no_animal') {
         errorMsg = `${icon} *No Animal Detected*\n\nNo identifiable animal was found in this image.`;
+      } else if (reason === 'target_not_found') {
+        errorMsg = `${icon} *Subject Not Found*\n\nCould not find the specified animal in the image.`;
       } else {
         errorMsg = `❌ *Could not identify animal*\n\n${reason}`;
       }
@@ -1981,6 +2623,8 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
         errorMsg += `\n\n💡 *Tip:* ${suggestion}`;
       } else if (['low_resolution', 'obstructed', 'too_distant', 'poor_quality'].includes(reason)) {
         errorMsg += `\n\n💡 *Tip:* Try sending a clearer, higher resolution photo with an unobstructed view of the animal.`;
+      } else if (reason === 'target_not_found') {
+        errorMsg += `\n\n💡 *Tip:* Try describing the animal differently or use /auto to let me identify automatically.`;
       }
       
       await ctx.api.sendMessage(targetChatId, errorMsg, { parse_mode: 'Markdown' });
