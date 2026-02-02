@@ -97,6 +97,7 @@ bot.catch((err) => {
 // Bot commands list
 const botCommands = [
   { command: 'start', description: '🦁 Welcome message' },
+  { command: 'menu', description: '📋 Show menu buttons' },
   { command: 'help', description: '📖 Show help' },
   { command: 'identify', description: '📷 How to identify animals' },
   { command: 'clear', description: '🗑️ Clear all chat messages' }
@@ -125,7 +126,11 @@ bot.command('start', async (ctx) => {
       `🦁 *Wildlife ID Bot*\n\n` +
       `Send me a photo of any animal and I'll identify it!\n\n` +
       `📷 Just send a photo - no commands needed!\n\n` +
-      `Tap the menu button ☰ to see all commands`,
+      `*Commands:*\n` +
+      `/start - Welcome message\n` +
+      `/help - Show help\n` +
+      `/identify - How to identify\n` +
+      `/clear - Clear chat messages`,
       { parse_mode: 'Markdown' }
     );
     console.log(`✅ /start reply sent successfully`);
@@ -157,6 +162,59 @@ bot.command('help', async (ctx) => {
     `3. Get detailed identification!`,
     { parse_mode: 'Markdown' }
   );
+});
+
+// Menu command - show clickable buttons (for forum/topic groups)
+bot.command('menu', async (ctx) => {
+  console.log(`📩 /menu command received from user ${ctx.from.id}`);
+  const menuKeyboard = new InlineKeyboard()
+    .text('🦁 Start', 'menu_start')
+    .text('📖 Help', 'menu_help').row()
+    .text('📷 How to Identify', 'menu_identify')
+    .text('🗑️ Clear Chat', 'menu_clear');
+  
+  await ctx.reply(
+    `📋 *Menu*\n\nTap a button below or just send a photo to identify an animal!`,
+    { parse_mode: 'Markdown', reply_markup: menuKeyboard }
+  );
+});
+
+// Handle menu button clicks
+bot.callbackQuery('menu_start', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply(
+    `🦁 *Wildlife ID Bot*\n\n` +
+    `Send me a photo of any animal and I'll identify it!\n\n` +
+    `📷 Just send a photo - no commands needed!`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.callbackQuery('menu_help', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply(
+    `📖 *How to use:*\n\n` +
+    `1. Send a photo of an animal\n` +
+    `2. Tell me where it was taken\n` +
+    `3. Get detailed identification!`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.callbackQuery('menu_identify', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply(
+    `📷 *How to Identify Animals:*\n\n` +
+    `1️⃣ Send a photo of an animal\n` +
+    `2️⃣ Tell me the location (or I'll use GPS from photo)\n` +
+    `3️⃣ Get detailed identification!\n\n` +
+    `_Just send a photo to get started!_`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.callbackQuery('menu_clear', async (ctx) => {
+  await ctx.answerCallbackQuery({ text: 'Type /clear to clear chat messages', show_alert: true });
 });
 
 // Clear command - delete ALL messages in chat (parallel deletion)
@@ -220,8 +278,17 @@ const lastIdentifications = new Map();
 // Key: `${scientificName}_${userId}`, Value: true
 const userReceivedImage = new Map();
 
-// Handle callback queries (button clicks)
-bot.on('callback_query:data', async (ctx) => {
+// Handle callback queries (button clicks) - non-blocking
+bot.on('callback_query:data', (ctx) => {
+  // Fire and forget - process callbacks independently
+  handleCallbackQuery(ctx).catch(err => {
+    console.error('Callback error:', err.message);
+    ctx.answerCallbackQuery({ text: '❌ Error occurred' }).catch(() => {});
+  });
+});
+
+// Async callback handler
+async function handleCallbackQuery(ctx) {
   const data = ctx.callbackQuery.data;
   
   if (data.startsWith('details_')) {
@@ -439,19 +506,44 @@ bot.on('callback_query:data', async (ctx) => {
       await ctx.answerCallbackQuery({ text: '❌ Data expired. Please identify again.' });
     }
   }
-});
+}
 
 // Handle photos - runs in parallel for multiple users
-bot.on('message:photo', async (ctx) => {
-  // Process each photo request independently (non-blocking)
-  handlePhotoMessage(ctx).catch(err => {
-    console.error('Photo handler error:', err);
-    ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
-  });
+// Each request is COMPLETELY INDEPENDENT - never blocks other requests
+bot.on('message:photo', (ctx) => {
+  // Fire and forget - don't await, don't block
+  // This allows multiple photos to be processed simultaneously
+  const requestId = `${ctx.from.id}-${Date.now()}`;
+  console.log(`📸 [${requestId}] New photo request started`);
+  
+  processPhotoWithTimeout(ctx, requestId)
+    .then(() => console.log(`✅ [${requestId}] Completed`))
+    .catch(err => {
+      console.error(`❌ [${requestId}] Failed:`, err.message);
+      ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
+    });
+  
+  // Return immediately - don't wait for processing
+  return;
 });
 
+// Wrapper with timeout to prevent hanging
+async function processPhotoWithTimeout(ctx, requestId) {
+  const TIMEOUT = 120000; // 2 minute timeout per request
+  
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Request timed out')), TIMEOUT);
+  });
+  
+  // Race between actual processing and timeout
+  return Promise.race([
+    handlePhotoMessage(ctx, requestId),
+    timeoutPromise
+  ]);
+}
+
 // Separate async function for photo processing
-async function handlePhotoMessage(ctx) {
+async function handlePhotoMessage(ctx, requestId = 'unknown') {
   // Get the largest photo (highest resolution)
   const photos = ctx.message.photo;
   const largestPhoto = photos[photos.length - 1];
@@ -705,9 +797,18 @@ async function processIdentification(ctx, buffer, location) {
   }
 }
 
-// Handle errors
+// Handle errors - NEVER crash the bot
 bot.catch((err) => {
-  console.error('Bot error:', err);
+  console.error('Bot error (handled, not crashing):', err.message);
+});
+
+// Global error handlers to prevent crashes
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection (not crashing):', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception (not crashing):', err.message);
 });
 
 module.exports = bot;
