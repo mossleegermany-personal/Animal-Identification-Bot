@@ -18,7 +18,23 @@ const GENERATION_CONFIG = {
 
 const PROMPT = `You are an expert wildlife biologist, ornithologist, and taxonomist with decades of field experience. 
 
-ANALYZE THIS IMAGE VERY CAREFULLY. Look at:
+FIRST, ASSESS IMAGE QUALITY:
+Before attempting identification, evaluate if the image is suitable:
+1. Is the resolution sufficient to see identifying features clearly?
+2. Is the animal significantly obstructed (by foliage, objects, blur)?
+3. Is the animal too distant to identify reliably?
+4. Is the image too dark, overexposed, or blurry?
+
+If the image quality is insufficient, return:
+{
+  "identified": false,
+  "reason": "low_resolution" | "obstructed" | "too_distant" | "poor_quality" | "no_animal",
+  "qualityIssue": "Specific description of what's wrong (e.g., 'Image resolution too low to see plumage details', 'Animal partially hidden behind branches', 'Subject is too far away to distinguish field marks')",
+  "suggestion": "Helpful tip (e.g., 'Please upload a higher resolution image', 'Try a photo with clearer view of the animal')"
+}
+
+IF IMAGE QUALITY IS ACCEPTABLE, ANALYZE CAREFULLY:
+Look at:
 1. Body shape, size proportions, and posture
 2. Bill/beak shape, size, and color
 3. Leg length, color, and structure
@@ -83,7 +99,7 @@ IMPORTANT for similarSpeciesRuledOut:
 - Use common names that users would recognize
 - Focus on species found in similar geographic regions
 
-If no animal: {"identified": false, "reason": "why"}`;
+If no animal: {"identified": false, "reason": "no_animal", "qualityIssue": "No animal detected in the image", "suggestion": "Please send a photo containing an animal"}`;
 
 async function identifyAnimal(imageBuffer, mimeType = 'image/jpeg', options = {}) {
   const base64Image = imageBuffer.toString('base64');

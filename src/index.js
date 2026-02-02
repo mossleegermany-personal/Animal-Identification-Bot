@@ -38,7 +38,9 @@ app.post('/webhook', (req, res, next) => {
     return res.status(200).json({ ok: true, message: 'Invalid update ignored' });
   }
   next();
-}, webhookCallback(bot, 'express'));
+}, webhookCallback(bot, 'express', {
+  timeoutMilliseconds: 180000 // 3 minutes timeout for long-running identification
+}));
 
 // Handle GET requests to /webhook (health checks, browser access)
 app.get('/webhook', (req, res) => {
