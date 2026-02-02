@@ -1254,6 +1254,7 @@ bot.command('skip', async (ctx) => {
   const identifyTarget = pendingRequest.identifyTarget;
   const exifLocation = pendingRequest.exifLocation;
   const threadId = pendingRequest.threadId;
+  const sourceMessageId = pendingRequest.sourceMessageId; // Original photo message ID for source link
   
   console.log(`⏭️ [${requestId}] Skip ${waitingFor || 'location'} in chat ${chatId}${isMediaGroup ? ' (media group)' : ''}`);
   
@@ -1287,7 +1288,7 @@ bot.command('skip', async (ctx) => {
   } else if (pendingBuffer) {
     // Process single photo without location - pass promptMsgId as statusMsgId
     try {
-      await processIdentificationWithChatId(ctx, pendingBuffer, noLocation, requestId, identifyTarget, chatId, threadId, pendingPromptMsgId);
+      await processIdentificationWithChatId(ctx, pendingBuffer, noLocation, requestId, identifyTarget, chatId, threadId, pendingPromptMsgId, sourceMessageId);
       // Consume rate limit on successful completion
       const consumed = rateLimiter.consume(chatId, userId);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
@@ -1332,6 +1333,7 @@ bot.on('message:text', async (ctx) => {
     const processedPhotos = pendingRequest.processedPhotos;
     const statusMsgId = pendingRequest.statusMsgId;
     const identifyTarget = pendingRequest.identifyTarget;
+    const sourceMessageId = pendingRequest.sourceMessageId; // Original photo message ID for source link
     
     console.log(`📍 [${requestId}] Location received in chat ${chatId}: "${location}"${isMediaGroup ? ' (media group)' : ''}`);
     
@@ -1363,7 +1365,7 @@ bot.on('message:text', async (ctx) => {
         // Get threadId from pending request if available
         const threadId = pendingRequest.threadId;
         // Pass the promptMsgId as statusMsgId so it can be deleted when result is ready
-        await processIdentificationWithChatId(ctx, pendingBuffer, location, requestId, identifyTarget, chatId, threadId, pendingPromptMsgId);
+        await processIdentificationWithChatId(ctx, pendingBuffer, location, requestId, identifyTarget, chatId, threadId, pendingPromptMsgId, sourceMessageId);
         // Consume rate limit on successful completion
         const consumed = rateLimiter.consume(chatId, userId);
         console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
@@ -1486,12 +1488,12 @@ async function handleCallbackQuery(ctx) {
       }
       
       // Create a request for tracking
-      const request = requestManager.createRequest(ctx, { chatId: targetChatId, userId, threadId: targetThreadId, statusMsgId: promptMsgId });
+      const request = requestManager.createRequest(ctx, { chatId: targetChatId, userId, threadId: targetThreadId, statusMsgId: promptMsgId, sourceMessageId: photoData.messageId });
       
       console.log(`📸 [${request.requestId}] Processing single photo from button for chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''} (${limitCheck.remaining} requests remaining)`);
       
       // Process the photo using stored file_id, original chat ID and thread ID
-      processSinglePhotoFromFileId(ctx, photoData.fileId, request, targetChatId, targetThreadId, promptMsgId)
+      processSinglePhotoFromFileId(ctx, photoData.fileId, request, targetChatId, targetThreadId, promptMsgId, photoData.messageId)
         .catch(err => {
           requestManager.updateStatus(request.requestId, 'failed', { error: err });
           ctx.api.sendMessage(targetChatId, `❌ Error: ${err.message}`, { message_thread_id: targetThreadId }).catch(() => {});
@@ -2022,12 +2024,13 @@ bot.on('message:photo', async (ctx) => {
  * @param {number} targetChatId - Target chat ID to send results to
  * @param {number} [targetThreadId] - Target thread ID for forum topics
  * @param {number} [statusMsgId] - Existing status message ID to update/delete
+ * @param {number} [sourceMessageId] - Original photo message ID for source link
  */
-async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, targetThreadId, statusMsgId) {
+async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, targetThreadId, statusMsgId, sourceMessageId) {
   const { requestId } = request;
   const chatId = targetChatId || ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
   const threadId = targetThreadId || ctx.callbackQuery?.message?.message_thread_id;
-  console.log(`🎯 [${requestId}] Target chat for results: ${chatId}${threadId ? ` (thread ${threadId})` : ''}`);
+  console.log(`🎯 [${requestId}] Target chat for results: ${chatId}${threadId ? ` (thread ${threadId})` : ''}${sourceMessageId ? ` (source msg: ${sourceMessageId})` : ''}`);
   
   try {
     requestManager.updateStatus(requestId, 'processing');
@@ -2064,7 +2067,7 @@ async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, 
     if (exifLocation) {
       // Has EXIF location - process immediately (auto-identify all)
       console.log(`📍 [${requestId}] Has EXIF location, processing immediately...`);
-      await processIdentificationWithChatId(ctx, buffer, exifLocation, requestId, null, chatId, threadId, statusMsgId);
+      await processIdentificationWithChatId(ctx, buffer, exifLocation, requestId, null, chatId, threadId, statusMsgId, sourceMessageId);
       const consumed = rateLimiter.consume(chatId, ctx.from.id);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
       requestManager.completeAndRemove(requestId);
@@ -2105,6 +2108,7 @@ async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, 
         req.identifyTarget = null; // Auto-identify all
         req.chatId = chatId;
         req.threadId = threadId; // Forum topic thread ID
+        req.sourceMessageId = sourceMessageId; // Original photo message ID for source link
         req.status = 'pending';
       }
       
@@ -2707,9 +2711,10 @@ async function processPhotoWithContext(ctx, request, captionTarget = null) {
  * @param {number} targetChatId - Target chat ID to send results to
  * @param {number} [targetThreadId] - Target thread ID for forum topics
  * @param {number} [statusMsgId] - Existing status message ID to use/delete
+ * @param {number} [sourceMessageId] - Original photo message ID for source link
  */
-async function processIdentificationWithChatId(ctx, buffer, location, requestId, identifyTarget, targetChatId, targetThreadId, statusMsgId) {
-  console.log(`🎯 [${requestId}] processIdentificationWithChatId targeting chat: ${targetChatId}${targetThreadId ? ` thread: ${targetThreadId}` : ''}${statusMsgId ? ` statusMsg: ${statusMsgId}` : ''}`);
+async function processIdentificationWithChatId(ctx, buffer, location, requestId, identifyTarget, targetChatId, targetThreadId, statusMsgId, sourceMessageId) {
+  console.log(`🎯 [${requestId}] processIdentificationWithChatId targeting chat: ${targetChatId}${targetThreadId ? ` thread: ${targetThreadId}` : ''}${statusMsgId ? ` statusMsg: ${statusMsgId}` : ''}${sourceMessageId ? ` sourceMsg: ${sourceMessageId}` : ''}`);
   
   // Create a proxy context that redirects all messages to the target chat/thread
   const modifiedCtx = {
@@ -2718,6 +2723,7 @@ async function processIdentificationWithChatId(ctx, buffer, location, requestId,
     api: ctx.api,
     threadId: targetThreadId, // Store for use in processIdentification
     statusMsgId: statusMsgId, // Existing status message to use
+    sourceMessageId: sourceMessageId, // Original photo message ID for source link
     // Override reply to always send to target chat and thread
     reply: (text, options = {}) => {
       console.log(`📤 [${requestId}] Sending message to chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''}`);
@@ -2745,8 +2751,9 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
   const targetUserId = ctx.from.id;
   const targetThreadId = ctx.threadId; // For forum topics
   const existingStatusMsgId = ctx.statusMsgId; // Existing status message to reuse
+  const sourceMessageId = ctx.sourceMessageId; // Original photo message ID for source link
   
-  console.log(`🎯 ${logPrefix} processIdentification: chat=${targetChatId}, thread=${targetThreadId || 'none'}, statusMsg=${existingStatusMsgId || 'new'}`);
+  console.log(`🎯 ${logPrefix} processIdentification: chat=${targetChatId}, thread=${targetThreadId || 'none'}, statusMsg=${existingStatusMsgId || 'new'}, sourceMsg=${sourceMessageId || 'none'}`);
   
   try {
     // Use existing status message or create new one
