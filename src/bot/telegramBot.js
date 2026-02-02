@@ -1220,13 +1220,13 @@ bot.command('skip', async (ctx) => {
   const noLocation = 'Unknown location';
   
   if (isMediaGroup && processedPhotos) {
-    // Process media group without location
+    // Process media group without location - pass threadId and statusMsgId for forum topics
     try {
-      await processMediaGroupPhotos(ctx, processedPhotos, noLocation, requestId, identifyTarget);
+      await processMediaGroupPhotos(ctx, processedPhotos, noLocation, requestId, identifyTarget, threadId, pendingPromptMsgId);
     } catch (error) {
       requestManager.updateStatus(requestId, 'failed', { error });
       requestManager._removeRequest(requestId);
-      await ctx.reply(`❌ Error processing photos: ${error.message}`);
+      await ctx.api.sendMessage(chatId, `❌ Error processing photos: ${error.message}`, { message_thread_id: threadId });
     }
   } else if (pendingBuffer) {
     // Process single photo without location - pass promptMsgId as statusMsgId
@@ -1290,13 +1290,15 @@ bot.on('message:text', async (ctx) => {
     
     // Handle media group vs single photo
     if (isMediaGroup && processedPhotos) {
-      // Process media group with location
+      // Process media group with location - pass threadId and statusMsgId for forum topics
+      const threadId = pendingRequest.threadId;
       try {
-        await processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget);
+        // Pass pendingPromptMsgId as statusMsgId to reuse the "Analyzing..." message
+        await processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget, threadId, pendingPromptMsgId);
       } catch (error) {
         requestManager.updateStatus(requestId, 'failed', { error });
         requestManager._removeRequest(requestId);
-        await ctx.reply(`❌ Error processing photos: ${error.message}`);
+        await ctx.api.sendMessage(chatId, `❌ Error processing photos: ${error.message}`, { message_thread_id: threadId });
       }
     } else {
       // Process single photo with captured context
@@ -1399,8 +1401,8 @@ async function handleCallbackQuery(ctx) {
         return;
       }
       
-      // Process the media group
-      await processMediaGroup(groupData.photos, chatId, null);
+      // Process the media group with threadId for forum topics
+      await processMediaGroup(groupData.photos, chatId, null, groupData.threadId);
       
     } else if (key.startsWith('photo_')) {
       const photoData = pendingPhotos.get(key);
@@ -1678,7 +1680,7 @@ async function handleCallbackQuery(ctx) {
 
 class MediaGroupCollector {
   constructor() {
-    /** @type {Map<string, {photos: MediaGroupPhoto[], timer: NodeJS.Timeout, chatId: number, userId: number}>} */
+    /** @type {Map<string, {photos: MediaGroupPhoto[], timer: NodeJS.Timeout, chatId: number, userId: number, resolvers: Function[]}>} */
     this.groups = new Map();
     this.collectTimeout = 1000; // Wait 1 second to collect all photos in group
   }
@@ -1702,32 +1704,106 @@ class MediaGroupCollector {
 
       if (!this.groups.has(mediaGroupId)) {
         // First photo in group - start collecting
+        console.log(`📸 Starting media group collection for ${mediaGroupId}`);
         this.groups.set(mediaGroupId, {
           photos: [photoData],
           chatId: ctx.chat.id,
           userId: ctx.from.id,
+          resolvers: [resolve], // Store all resolver functions
           timer: setTimeout(() => {
-            // Collection complete - return all photos
+            // Collection complete
             const group = this.groups.get(mediaGroupId);
             this.groups.delete(mediaGroupId);
             if (group) {
               console.log(`📸 Media group ${mediaGroupId} collected: ${group.photos.length} photos`);
-              resolve(group.photos);
+              // Resolve first resolver with photos, others with null
+              group.resolvers.forEach((res, index) => {
+                res(index === 0 ? group.photos : null);
+              });
             }
           }, this.collectTimeout),
-          resolve, // Store resolve function for first photo
         });
       } else {
         // Additional photo in group
+        console.log(`📸 Adding photo to media group ${mediaGroupId}`);
         const group = this.groups.get(mediaGroupId);
         group.photos.push(photoData);
-        resolve(null); // Not the first photo, will be handled by the timer
+        group.resolvers.push(resolve); // Store this resolver too - will be resolved with null
       }
     });
   }
 }
 
 const mediaGroupCollector = new MediaGroupCollector();
+
+// ============================================
+// SINGLE PHOTO BATCH COLLECTOR
+// Groups single photos sent in quick succession (no media_group_id)
+// ============================================
+
+class SinglePhotoBatchCollector {
+  constructor() {
+    /** @type {Map<string, {photos: Array, timer: NodeJS.Timeout, chatId: number, userId: number, threadId: number, resolvers: Function[]}>} */
+    this.batches = new Map();
+    this.collectTimeout = 1500; // Wait 1.5 seconds to collect photos sent quickly
+  }
+
+  /**
+   * Add a single photo - batches photos from same user/chat
+   * @param {Object} ctx - Grammy context
+   * @returns {Promise<Array|null>} Returns array of photos when collection is complete, null otherwise
+   */
+  addPhoto(ctx) {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+    const threadId = ctx.message.message_thread_id;
+    const batchKey = `batch_${chatId}_${userId}`;
+    
+    const photos = ctx.message.photo;
+    const largestPhoto = photos[photos.length - 1];
+    
+    const photoData = {
+      ctx,
+      photo: largestPhoto,
+      messageId: ctx.message.message_id,
+      fileId: largestPhoto.file_id,
+    };
+
+    return new Promise((resolve) => {
+      if (!this.batches.has(batchKey)) {
+        // First photo - start collecting
+        console.log(`📸 Starting new batch for ${batchKey}`);
+        this.batches.set(batchKey, {
+          photos: [photoData],
+          chatId,
+          userId,
+          threadId,
+          resolvers: [resolve], // Store all resolver functions
+          timer: setTimeout(() => {
+            // Collection complete
+            const batch = this.batches.get(batchKey);
+            this.batches.delete(batchKey);
+            if (batch) {
+              console.log(`📸 Single photo batch collected: ${batch.photos.length} photos from user ${userId} in chat ${chatId}`);
+              // Resolve first resolver with photos, others with null
+              batch.resolvers.forEach((res, index) => {
+                res(index === 0 ? batch.photos : null);
+              });
+            }
+          }, this.collectTimeout),
+        });
+      } else {
+        // Additional photo in batch
+        console.log(`📸 Adding photo to existing batch ${batchKey}`);
+        const batch = this.batches.get(batchKey);
+        batch.photos.push(photoData);
+        batch.resolvers.push(resolve); // Store this resolver too - will be resolved with null
+      }
+    });
+  }
+}
+
+const singlePhotoBatchCollector = new SinglePhotoBatchCollector();
 
 // ============================================
 // PHOTO MESSAGE HANDLER
@@ -1759,10 +1835,13 @@ bot.on('message:photo', async (ctx) => {
       
       // Store collected photos temporarily for later processing
       const groupKey = `group_${chatId}_${userId}_${Date.now()}`;
+      // Get threadId from first photo context for forum topics
+      const threadId = collectedPhotos[0]?.ctx?.message?.message_thread_id;
       pendingPhotoGroups.set(groupKey, {
         photos: collectedPhotos,
         chatId,
         userId,
+        threadId,
         timestamp: Date.now(),
       });
       
@@ -1789,52 +1868,100 @@ bot.on('message:photo', async (ctx) => {
     return;
   }
   
-  // Single photo - check rate limit first
-  const limitCheck = rateLimiter.checkLimit(chatId, userId);
-  if (!limitCheck.allowed) {
-    // Don't show prompt if rate limited
-    console.log(`📷 Photo shared by user ${userId} in chat ${chatId} (rate limited)`);
+  // Single photo (no media_group_id) - use batch collector to group photos sent quickly
+  const collectedPhotos = await singlePhotoBatchCollector.addPhoto(ctx);
+  
+  if (!collectedPhotos) {
+    // Not the first photo, will be handled by batch collector timer
     return;
   }
   
-  // Get the largest photo (highest resolution)
-  const photos = ctx.message.photo;
-  const largestPhoto = photos[photos.length - 1];
+  // Batch collection complete - now process
+  const photoCount = collectedPhotos.length;
+  const threadId = collectedPhotos[0].ctx.message.message_thread_id;
   
-  // Get message_thread_id for forum topics (like Wildlife topic)
-  const threadId = ctx.message.message_thread_id;
+  // Check rate limit first
+  const limitCheck = rateLimiter.checkLimit(chatId, userId);
+  if (!limitCheck.allowed) {
+    console.log(`📷 ${photoCount} photo(s) shared by user ${userId} in chat ${chatId} (rate limited)`);
+    return;
+  }
   
-  // Store photo info temporarily for later processing (include photo file_id)
-  const photoKey = `photo_${chatId}_${userId}_${messageId}`;
-  pendingPhotos.set(photoKey, {
-    messageId,
-    chatId,
-    userId,
-    fileId: largestPhoto.file_id,
-    threadId, // Forum topic thread ID
-    timestamp: Date.now(),
-  });
-  
-  // Auto-expire after 5 minutes
-  setTimeout(() => pendingPhotos.delete(photoKey), 5 * 60 * 1000);
-  
-  // Show prompt with buttons
-  await ctx.reply(
-    `📸 *1 photo received!*\n\n` +
-    `Would you like me to identify the animals?`,
-    {
-      parse_mode: 'Markdown',
-      reply_to_message_id: messageId,
-      reply_markup: {
-        inline_keyboard: [[
-          { text: '✅ Yes, identify', callback_data: `id_yes_${photoKey}` },
-          { text: '❌ No thanks', callback_data: `id_no_${photoKey}` }
-        ]]
+  if (photoCount === 1) {
+    // Single photo - use simple flow
+    const photo = collectedPhotos[0];
+    const photoKey = `photo_${chatId}_${userId}_${photo.messageId}`;
+    
+    pendingPhotos.set(photoKey, {
+      messageId: photo.messageId,
+      chatId,
+      userId,
+      fileId: photo.fileId,
+      threadId,
+      timestamp: Date.now(),
+    });
+    
+    // Auto-expire after 5 minutes
+    setTimeout(() => pendingPhotos.delete(photoKey), 5 * 60 * 1000);
+    
+    // Show prompt with buttons
+    await ctx.api.sendMessage(chatId,
+      `📸 *1 photo received!*\n\n` +
+      `Would you like me to identify the animals?`,
+      {
+        parse_mode: 'Markdown',
+        reply_to_message_id: photo.messageId,
+        message_thread_id: threadId,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Yes, identify', callback_data: `id_yes_${photoKey}` },
+            { text: '❌ No thanks', callback_data: `id_no_${photoKey}` }
+          ]]
+        }
       }
-    }
-  );
-  
-  console.log(`📷 Photo shared in chat ${chatId} by user ${userId} - awaiting identification decision`);
+    );
+    
+    console.log(`📷 Photo shared in chat ${chatId} by user ${userId} - awaiting identification decision`);
+  } else {
+    // Multiple photos batched together - treat like media group
+    const groupKey = `group_${chatId}_${userId}_${Date.now()}`;
+    
+    // Convert to same format as media group
+    const groupPhotos = collectedPhotos.map(p => ({
+      ctx: p.ctx,
+      photo: p.photo,
+      messageId: p.messageId,
+    }));
+    
+    pendingPhotoGroups.set(groupKey, {
+      photos: groupPhotos,
+      chatId,
+      userId,
+      threadId,
+      timestamp: Date.now(),
+    });
+    
+    // Auto-expire after 5 minutes
+    setTimeout(() => pendingPhotoGroups.delete(groupKey), 5 * 60 * 1000);
+    
+    // Show prompt with buttons
+    await ctx.api.sendMessage(chatId,
+      `📸 *${photoCount} photos received!*\n\n` +
+      `Would you like me to identify the animals?`,
+      {
+        parse_mode: 'Markdown',
+        message_thread_id: threadId,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Yes, identify', callback_data: `id_yes_${groupKey}` },
+            { text: '❌ No thanks', callback_data: `id_no_${groupKey}` }
+          ]]
+        }
+      }
+    );
+    
+    console.log(`📷 ${photoCount} photos batched in chat ${chatId} - awaiting identification decision`);
+  }
 });
 
 /**
@@ -1937,25 +2064,28 @@ async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, 
  * @param {MediaGroupPhoto[]} photos - Array of collected photos
  * @param {number} chatId - Chat ID
  * @param {string} [captionTarget] - What to identify from caption
+ * @param {number} [threadId] - Thread ID for forum topics
  */
-async function processMediaGroup(photos, chatId, captionTarget = null) {
+async function processMediaGroup(photos, chatId, captionTarget = null, threadId = null) {
   const firstCtx = photos[0].ctx;
   const photoCount = photos.length;
+  // Use provided threadId or get from first context
+  const targetThreadId = threadId || firstCtx.message?.message_thread_id;
   
   // If target provided in caption, skip the "what to identify" question
   if (captionTarget) {
     // Send initial status message
-    const statusMsg = await firstCtx.reply(
+    const statusMsg = await firstCtx.api.sendMessage(chatId,
       `📸 *Processing ${photoCount} photo${photoCount > 1 ? 's' : ''}...*\n\n` +
       `🎯 Looking for: ${captionTarget}`,
-      { parse_mode: 'Markdown' }
+      { parse_mode: 'Markdown', message_thread_id: targetThreadId }
     );
     
     // Ask for location
-    const promptMsg = await firstCtx.reply(
+    const promptMsg = await firstCtx.api.sendMessage(chatId,
       `🌍 *Where were these photos taken?*\n\n` +
       `Reply with location or /skip`,
-      { parse_mode: 'Markdown' }
+      { parse_mode: 'Markdown', message_thread_id: targetThreadId }
     );
     
     // Store as pending request
@@ -2009,7 +2139,7 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
         await firstCtx.api.deleteMessage(chatId, promptMsg.message_id);
       } catch (e) {}
       
-      await processMediaGroupPhotos(firstCtx, processedPhotos, exifLocation, groupRequest.requestId, captionTarget);
+      await processMediaGroupPhotos(firstCtx, processedPhotos, exifLocation, groupRequest.requestId, captionTarget, targetThreadId);
     } else {
       // No EXIF - wait for location
       const req = requestManager.getRequest(groupRequest.requestId);
@@ -2022,6 +2152,8 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
         req.status = 'pending';
         req.waitingFor = 'location';
         req.identifyTarget = captionTarget;
+        req.threadId = targetThreadId;
+        req.chatId = chatId;
       }
     }
     return;
@@ -2035,9 +2167,9 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
   });
   
   // Send initial status message
-  const statusMsg = await firstCtx.reply(
+  const statusMsg = await firstCtx.api.sendMessage(chatId,
     `📸 *Processing ${photoCount} photo${photoCount > 1 ? 's' : ''}...*`,
-    { parse_mode: 'Markdown' }
+    { parse_mode: 'Markdown', message_thread_id: targetThreadId }
   );
   
   // Download and process all images in parallel
@@ -2088,13 +2220,13 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
     } catch (e) {}
     
     // Process all photos with the location
-    await processMediaGroupPhotos(firstCtx, processedPhotos, exifLocation, groupRequest.requestId, null);
+    await processMediaGroupPhotos(firstCtx, processedPhotos, exifLocation, groupRequest.requestId, null, targetThreadId);
   } else {
     // No EXIF - ask for location only
-    const promptMsg = await firstCtx.reply(
+    const promptMsg = await firstCtx.api.sendMessage(chatId,
       `🌍 *Where were these photos taken?*\n\n` +
       `Reply with location or /skip`,
-      { parse_mode: 'Markdown' }
+      { parse_mode: 'Markdown', message_thread_id: targetThreadId }
     );
     
     // Store pending data
@@ -2108,6 +2240,8 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
       req.status = 'pending';
       req.waitingFor = 'location';
       req.identifyTarget = null; // Auto-identify all
+      req.threadId = targetThreadId;
+      req.chatId = chatId;
     }
   }
 }
@@ -2119,23 +2253,43 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
  * @param {string} location - Location string
  * @param {string} requestId - Request ID
  * @param {string} [identifyTarget] - What to identify in the photos
+ * @param {number} [threadId] - Thread ID for forum topics
+ * @param {number} [statusMsgId] - Existing status message ID to reuse
  */
-async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget = null) {
+async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId, identifyTarget = null, threadId = null, statusMsgId = null) {
   const chatId = ctx.chat.id;
   const userId = ctx.from.id;
+  const targetThreadId = threadId || ctx.message?.message_thread_id;
   const validPhotos = processedPhotos.filter(p => !p.error);
   
   if (validPhotos.length === 0) {
-    await ctx.reply('❌ Failed to process all photos. Please try again.');
+    // Delete status message if exists
+    if (statusMsgId) {
+      try { await ctx.api.deleteMessage(chatId, statusMsgId); } catch (e) {}
+    }
+    await ctx.api.sendMessage(chatId, '❌ Failed to process all photos. Please try again.', { message_thread_id: targetThreadId });
     requestManager._removeRequest(requestId);
     return;
   }
   
-  // Show processing status
-  const processingMsg = await ctx.reply(
-    `🔬 *Analyzing ${validPhotos.length} photo${validPhotos.length > 1 ? 's' : ''}...*`,
-    { parse_mode: 'Markdown' }
-  );
+  // Reuse existing status message or create new one
+  let processingMsg;
+  if (statusMsgId) {
+    // Edit existing message
+    const statusText = validPhotos.length > 1 
+      ? `🔬 *Analyzing ${validPhotos.length} photos...*`
+      : `🔬 *Analyzing...*`;
+    try {
+      await ctx.api.editMessageText(chatId, statusMsgId, statusText, { parse_mode: 'Markdown' });
+    } catch (e) {}
+    processingMsg = { message_id: statusMsgId };
+  } else {
+    // Create new status message
+    processingMsg = await ctx.api.sendMessage(chatId,
+      `🔬 *Analyzing ${validPhotos.length} photo${validPhotos.length > 1 ? 's' : ''}...*`,
+      { parse_mode: 'Markdown', message_thread_id: targetThreadId }
+    );
+  }
   
   // Process each photo and collect results
   const results = [];
@@ -2144,13 +2298,15 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
     const photo = validPhotos[i];
     
     try {
-      // Update status
-      await ctx.api.editMessageText(
-        chatId,
-        processingMsg.message_id,
-        `🔬 *Analyzing photo ${i + 1}/${validPhotos.length}...*`,
-        { parse_mode: 'Markdown' }
-      ).catch(() => {});
+      // Update status only if multiple photos
+      if (validPhotos.length > 1) {
+        await ctx.api.editMessageText(
+          chatId,
+          processingMsg.message_id,
+          `🔬 *Analyzing photo ${i + 1}/${validPhotos.length}...*`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
       
       // Identify the animal
       const result = await identifyAnimal(photo.buffer, 'image/jpeg', { location, identifyTarget });
@@ -2271,25 +2427,27 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
             await ctx.api.sendPhoto(chatId, new InputFile(compositeBuffer, 'identification.jpg'), {
               caption: `${linksText}${countText}`,
               parse_mode: 'Markdown',
-              reply_markup: { inline_keyboard: followUpButtons }
+              reply_markup: { inline_keyboard: followUpButtons },
+              message_thread_id: targetThreadId
             });
           } else {
             await ctx.api.sendPhoto(chatId, iNatPhoto.photoUrl, {
               caption: `*${d.commonName}*\n_${d.scientificName}_${countText}\n\n${linksText}`,
               parse_mode: 'Markdown',
-              reply_markup: { inline_keyboard: followUpButtons }
+              reply_markup: { inline_keyboard: followUpButtons },
+              message_thread_id: targetThreadId
             });
           }
         } catch (e) {
           await ctx.api.sendMessage(chatId, 
             `*${d.commonName}*\n_${d.scientificName}_${countText}\n\n${linksText}`,
-            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: followUpButtons } }
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: followUpButtons }, message_thread_id: targetThreadId }
           );
         }
       } else {
         await ctx.api.sendMessage(chatId,
           `*${d.commonName}*\n_${d.scientificName}_${countText}\n\n${linksText}`,
-          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: followUpButtons } }
+          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: followUpButtons }, message_thread_id: targetThreadId }
         );
       }
     }
@@ -2352,7 +2510,7 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
     }
     
     if (failMsg) {
-      await ctx.reply(failMsg, { parse_mode: 'Markdown' });
+      await ctx.api.sendMessage(chatId, failMsg, { parse_mode: 'Markdown', message_thread_id: targetThreadId });
     }
   }
   
