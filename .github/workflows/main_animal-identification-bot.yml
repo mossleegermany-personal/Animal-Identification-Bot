@@ -68,6 +68,7 @@ jobs:
               { "name": "GEMINI_API_KEY", "value": "${{ secrets.GEMINI_API_KEY }}" },
               { "name": "TELEGRAM_BOT_TOKEN", "value": "${{ secrets.TELEGRAM_BOT_TOKEN }}" },
               { "name": "EBIRD_API_KEY", "value": "${{ secrets.EBIRD_API_KEY }}" },
+              { "name": "WEBHOOK_URL", "value": "https://animal-identification-bot.azurewebsites.net" },
               { "name": "PORT", "value": "3000" },
               { "name": "WEBSITE_NODE_DEFAULT_VERSION", "value": "~20" },
               { "name": "WEBSITES_ENABLE_APP_SERVICE_STORAGE", "value": "false" },

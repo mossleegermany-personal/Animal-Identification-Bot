@@ -1,19 +1,23 @@
 require('dotenv').config();
 const express = require('express');
-const { run } = require('@grammyjs/runner');
+const { webhookCallback } = require('grammy');
 const bot = require('./bot/telegramBot');
 
 // ============================================
-// EXPRESS SERVER - Keeps Azure App Alive 24/7
+// EXPRESS SERVER WITH WEBHOOK
 // ============================================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Health check endpoint - Azure pings this to keep app alive
+// Webhook secret for security (optional but recommended)
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'wildlife-bot-secret';
+
+// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
     bot: 'Wildlife ID Bot',
+    mode: 'webhook',
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
   });
@@ -23,45 +27,58 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', uptime: Math.floor(process.uptime()) });
 });
 
-// Start HTTP server
-app.listen(PORT, () => {
-  console.log(`🌐 Health server running on port ${PORT}`);
-});
+// Telegram webhook endpoint
+app.use('/webhook', webhookCallback(bot, 'express'));
 
 // ============================================
-// TELEGRAM BOT - Parallel Processing
+// START SERVER & SETUP WEBHOOK
 // ============================================
-console.log('🦁 Starting Wildlife ID Bot...');
+console.log('🦁 Starting Wildlife ID Bot (Webhook Mode)...');
 console.log('🤖 Using Gemini 2.5 Pro / Flash models');
-console.log('⚡ Parallel request handling enabled');
 
-// Use runner for true concurrent/parallel request processing
-// Each update is processed independently - no blocking between users
-const runner = run(bot, {
-  // Process updates concurrently (not sequentially)
-  fetcher: {
-    // Allow multiple updates to be fetched at once
-    allowedUpdates: ['message', 'callback_query']
-  },
-  // No sequential constraints - full parallel processing
-  runner: {
-    fetch: {
-      // Fetch multiple updates
-      limit: 100
+async function startServer() {
+  // Start HTTP server first
+  app.listen(PORT, () => {
+    console.log(`🌐 Server running on port ${PORT}`);
+  });
+
+  // Setup webhook if WEBHOOK_URL is provided (for production)
+  const webhookUrl = process.env.WEBHOOK_URL;
+  
+  if (webhookUrl) {
+    try {
+      // Delete any existing webhook first
+      await bot.api.deleteWebhook();
+      
+      // Set new webhook
+      await bot.api.setWebhook(`${webhookUrl}/webhook`, {
+        allowed_updates: ['message', 'callback_query'],
+        drop_pending_updates: true
+      });
+      
+      const botInfo = await bot.api.getMe();
+      console.log(`✅ Bot started as @${botInfo.username}`);
+      console.log(`🔗 Webhook set to: ${webhookUrl}/webhook`);
+      console.log('📸 Ready to identify animals!');
+    } catch (err) {
+      console.error('❌ Failed to set webhook:', err.message);
     }
+  } else {
+    // Local development - use polling
+    console.log('⚠️ No WEBHOOK_URL set - starting in polling mode for local dev');
+    await bot.api.deleteWebhook();
+    bot.start({
+      allowed_updates: ['message', 'callback_query'],
+      drop_pending_updates: true
+    });
+    
+    const botInfo = await bot.api.getMe();
+    console.log(`✅ Bot started as @${botInfo.username} (polling mode)`);
   }
-});
+}
 
-// Get bot info and log startup
-bot.api.getMe().then((botInfo) => {
-  console.log(`✅ Bot started as @${botInfo.username}`);
-  console.log('📸 Ready to identify animals!');
-  console.log('🔄 Processing requests in parallel - no blocking!');
-}).catch(err => {
-  console.error('❌ Failed to start bot:', err.message);
-});
+startServer();
 
 // Graceful shutdown
-const stopRunner = () => runner.isRunning() && runner.stop();
-process.once('SIGINT', stopRunner);
-process.once('SIGTERM', stopRunner);
+process.once('SIGINT', () => bot.stop());
+process.once('SIGTERM', () => bot.stop());
