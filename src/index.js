@@ -12,6 +12,9 @@ const PORT = process.env.PORT || 3000;
 // Webhook secret for security (optional but recommended)
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'wildlife-bot-secret';
 
+// Parse JSON bodies for webhook validation
+app.use(express.json());
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
@@ -27,8 +30,20 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', uptime: Math.floor(process.uptime()) });
 });
 
-// Telegram webhook endpoint
-app.use('/webhook', webhookCallback(bot, 'express'));
+// Telegram webhook endpoint with validation
+app.post('/webhook', (req, res, next) => {
+  // Validate that the request body contains a valid Telegram update
+  if (!req.body || typeof req.body.update_id === 'undefined') {
+    console.log('Invalid webhook request received (missing update_id)');
+    return res.status(200).json({ ok: true, message: 'Invalid update ignored' });
+  }
+  next();
+}, webhookCallback(bot, 'express'));
+
+// Handle GET requests to /webhook (health checks, browser access)
+app.get('/webhook', (req, res) => {
+  res.json({ status: 'ok', message: 'Webhook endpoint active' });
+});
 
 // ============================================
 // START SERVER & SETUP WEBHOOK
