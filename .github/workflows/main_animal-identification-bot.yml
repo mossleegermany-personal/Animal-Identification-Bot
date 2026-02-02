@@ -55,6 +55,10 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9F35C7FA76454B98B9E65A6749AC67D1 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_FF70E825229B42D0AA8E509990F6DCC3 }}
 
+      - name: Start Web App (if stopped)
+        run: |
+          az webapp start --name animal-identification-bot --resource-group animal-wildlife || echo "App may already be running"
+
       - name: Configure Azure Web App Settings
         uses: azure/appservice-settings@v1
         with:
