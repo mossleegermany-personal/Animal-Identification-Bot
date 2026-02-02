@@ -89,18 +89,12 @@ async function isValidUrl(url) {
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
-// Enable concurrent request handling - process multiple photos simultaneously
-bot.use(async (ctx, next) => {
-  // Don't await - let requests process in parallel
-  next().catch(err => console.error('Handler error:', err));
-});
-
 // Set up bot commands menu
 bot.api.setMyCommands([
   { command: 'start', description: '🦁 Welcome message' },
   { command: 'help', description: '📖 Show help' },
   { command: 'clear', description: '🗑️ Clear all chat messages' }
-]);
+]).catch(err => console.error('Failed to set commands:', err));
 
 // Store pending photos waiting for location (keyed by uniqueId = odels
 const pendingPhotos = new Map();
@@ -460,14 +454,17 @@ async function handlePhotoMessage(ctx) {
   
   if (exifLocation) {
     // Image has GPS coordinates - process immediately
+    console.log(`📍 Using EXIF location: ${exifLocation}`);
     await processIdentification(ctx, buffer, exifLocation);
   } else {
     // No EXIF GPS - always ask for location (ignore caption)
+    console.log(`📍 No EXIF GPS found, asking user for location...`);
     const promptMsg = await ctx.reply(
       `🌍 *Where was this photo taken?*\n\n` +
       `Reply with location or /skip`,
       { parse_mode: 'Markdown' }
     );
+    console.log(`📍 Location prompt sent, message ID: ${promptMsg.message_id}`);
     
     // Store pending photo with prompt message ID
     pendingPhotos.set(ctx.from.id, { 
