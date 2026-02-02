@@ -319,6 +319,15 @@ const requestManager = new RequestManager({
 // Resets every Monday 00:00 SST (UTC+8)
 // ============================================
 
+const fs = require('fs');
+const path = require('path');
+
+// Rate limit data persistence file
+// Use /home on Azure for persistence across deployments, fallback to local for dev
+const RATE_LIMIT_FILE = process.env.WEBSITE_SITE_NAME 
+  ? '/home/rate_limits.json'  // Azure App Service persistent storage
+  : path.join(__dirname, '..', '..', 'rate_limits.json');  // Local development
+
 class WeeklyRateLimiter {
   constructor(options = {}) {
     /** @type {Map<string, {count: number, resetAt: number}>} key -> usage data */
@@ -331,8 +340,14 @@ class WeeklyRateLimiter {
       timezone: options.timezone || 'Asia/Singapore',  // SST = UTC+8
     };
     
+    // Load persisted data
+    this._loadFromFile();
+    
     // Schedule weekly reset check every hour
     this._resetTimer = setInterval(() => this._checkResets(), 3600000);
+    
+    // Save to file every 5 minutes
+    this._saveTimer = setInterval(() => this._saveToFile(), 5 * 60 * 1000);
     
     console.log(`📊 WeeklyRateLimiter initialized: ${this.config.maxGroupRequestsPerWeek} requests/week per group, ${this.config.maxPmRequestsPerWeek} requests/week per user (PM)`);
   }
@@ -477,6 +492,9 @@ class WeeklyRateLimiter {
     const typeLabel = isPrivate ? `User ${userId}` : `Group ${chatId}`;
     console.log(`📊 ${typeLabel} usage: ${data.count}/${limit} (${remaining} remaining)`);
     
+    // Save immediately after consuming
+    this._saveToFile();
+    
     return {
       success: true,
       remaining,
@@ -562,12 +580,64 @@ class WeeklyRateLimiter {
   }
 
   /**
+   * Load rate limit data from file
+   * @private
+   */
+  _loadFromFile() {
+    try {
+      if (fs.existsSync(RATE_LIMIT_FILE)) {
+        const data = JSON.parse(fs.readFileSync(RATE_LIMIT_FILE, 'utf8'));
+        const now = Date.now();
+        let loaded = 0;
+        let expired = 0;
+        
+        for (const [key, value] of Object.entries(data)) {
+          // Only load if not expired
+          if (value.resetAt > now) {
+            this.usage.set(key, value);
+            loaded++;
+          } else {
+            expired++;
+          }
+        }
+        console.log(`📊 Loaded ${loaded} rate limit entries from file (${expired} expired entries skipped)`);
+      } else {
+        console.log('📊 No rate limit file found, starting fresh');
+      }
+    } catch (err) {
+      console.error('⚠️ Failed to load rate limits:', err.message);
+    }
+  }
+
+  /**
+   * Save rate limit data to file
+   * @private
+   */
+  _saveToFile() {
+    try {
+      const data = {};
+      for (const [key, value] of this.usage.entries()) {
+        data[key] = value;
+      }
+      fs.writeFileSync(RATE_LIMIT_FILE, JSON.stringify(data, null, 2));
+      console.log(`📊 Saved ${this.usage.size} rate limit entries to file`);
+    } catch (err) {
+      console.error('⚠️ Failed to save rate limits:', err.message);
+    }
+  }
+
+  /**
    * Shutdown limiter
    */
   shutdown() {
     if (this._resetTimer) {
       clearInterval(this._resetTimer);
     }
+    if (this._saveTimer) {
+      clearInterval(this._saveTimer);
+    }
+    // Save before shutdown
+    this._saveToFile();
     console.log('📊 WeeklyRateLimiter shutdown');
   }
 }
@@ -816,9 +886,9 @@ const botCommands = [
   { command: 'clear', description: '🗑️ Clear all chat messages' }
 ];
 
-// Set up bot commands menu for all scopes (private chats, groups, etc.)
+// Set up bot commands menu for all scopes
 Promise.all([
-  // Default scope (private chats)
+  // Default scope
   bot.api.setMyCommands(botCommands),
   // All group chats
   bot.api.setMyCommands(botCommands, { scope: { type: 'all_group_chats' } }),
@@ -831,7 +901,7 @@ Promise.all([
 // Start command
 bot.command('start', async (ctx) => {
   if (!isAllowedThread(ctx)) return;
-  console.log(`📩 /start command received from user ${ctx.from.id}`);
+  console.log(`📩 /start command received from user ${ctx.from.id} in chat ${ctx.chat.id} (thread: ${ctx.message?.message_thread_id || 'none'})`);
   try {
     await ctx.reply(
       `🦁 *Wildlife ID Bot*\n\n` +
