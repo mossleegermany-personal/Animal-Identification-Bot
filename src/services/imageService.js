@@ -78,7 +78,7 @@ async function createCompositeImage(photoUrl, data) {
       
       badgeSvg += `
         <rect x="${xOffset}" y="${yOffset}" width="${textWidth}" height="32" rx="16" fill="${badge.color}"/>
-        <text x="${xOffset + textWidth/2}" y="${yOffset + 22}" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white" text-anchor="middle">
+        <text x="${xOffset + textWidth/2}" y="${yOffset + 22}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="14" font-weight="bold" fill="white" text-anchor="middle">
           ${escapeXml(badge.text)}
         </text>
       `;
@@ -101,10 +101,10 @@ async function createCompositeImage(photoUrl, data) {
     // Build subspecies section only if valid
     const subspeciesSection = hasValidSubspecies ? `
         <!-- Subspecies section -->
-        <text x="20" y="${bodyY + 110}" font-family="Arial, sans-serif" font-size="12" fill="#666666" font-weight="bold">
+        <text x="20" y="${bodyY + 110}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="12" fill="#666666" font-weight="bold">
           SUBSPECIES
         </text>
-        <text x="20" y="${bodyY + 135}" font-family="Arial, sans-serif" font-size="22" font-style="italic" fill="#999999">
+        <text x="20" y="${bodyY + 135}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="22" font-style="italic" fill="#999999">
           ${escapeXml(subspecies)}
         </text>
     ` : '';
@@ -121,10 +121,10 @@ async function createCompositeImage(photoUrl, data) {
         <line x1="20" y1="${headerHeight - 5}" x2="${textPanelWidth - 20}" y2="${headerHeight - 5}" stroke="#333333" stroke-width="1"/>
         
         <!-- BODY: Species Info -->
-        <text x="20" y="${bodyY + 35}" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="white">
+        <text x="20" y="${bodyY + 35}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="36" font-weight="bold" fill="white">
           ${escapeXml(commonName)}
         </text>
-        <text x="20" y="${bodyY + 70}" font-family="Arial, sans-serif" font-size="20" font-style="italic" fill="#bbbbbb">
+        <text x="20" y="${bodyY + 70}" font-family="DejaVu Sans, Liberation Sans, FreeSans, sans-serif" font-size="20" font-style="italic" fill="#bbbbbb">
           ${escapeXml(scientificName)}
         </text>
         
