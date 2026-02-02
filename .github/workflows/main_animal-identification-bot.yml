@@ -56,16 +56,22 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_FF70E825229B42D0AA8E509990F6DCC3 }}
 
       - name: Configure Azure Web App Settings
-        run: |
-          az webapp config appsettings set --name animal-identification-bot --resource-group ${{ secrets.AZURE_RESOURCE_GROUP || 'animal-identification-bot_group' }} --settings \
-            GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
-            TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
-            EBIRD_API_KEY="${{ secrets.EBIRD_API_KEY }}" \
-            PORT="3000" \
-            WEBSITE_NODE_DEFAULT_VERSION="~20"
-          az webapp config set --name animal-identification-bot --resource-group ${{ secrets.AZURE_RESOURCE_GROUP || 'animal-identification-bot_group' }} \
-            --linux-fx-version "NODE|20-lts" \
-            --startup-file "bash startup.sh"
+        uses: azure/appservice-settings@v1
+        with:
+          app-name: 'animal-identification-bot'
+          app-settings-json: |
+            [
+              { "name": "GEMINI_API_KEY", "value": "${{ secrets.GEMINI_API_KEY }}" },
+              { "name": "TELEGRAM_BOT_TOKEN", "value": "${{ secrets.TELEGRAM_BOT_TOKEN }}" },
+              { "name": "EBIRD_API_KEY", "value": "${{ secrets.EBIRD_API_KEY }}" },
+              { "name": "PORT", "value": "3000" },
+              { "name": "WEBSITE_NODE_DEFAULT_VERSION", "value": "~20" }
+            ]
+          general-settings-json: |
+            {
+              "linuxFxVersion": "NODE|20-lts",
+              "appCommandLine": "bash startup.sh"
+            }
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
