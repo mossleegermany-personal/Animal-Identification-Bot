@@ -101,16 +101,23 @@ const pendingPhotos = new Map();
 
 // Start command
 bot.command('start', async (ctx) => {
-  await ctx.reply(
-    `🦁 *Wildlife ID Bot*\n\n` +
-    `Send me a photo of any animal and I'll identify it!\n\n` +
-    `Tap the menu button (/) to see commands`,
-    { parse_mode: 'Markdown' }
-  );
+  console.log(`📩 /start command received from user ${ctx.from.id}`);
+  try {
+    await ctx.reply(
+      `🦁 *Wildlife ID Bot*\n\n` +
+      `Send me a photo of any animal and I'll identify it!\n\n` +
+      `Tap the menu button (/) to see commands`,
+      { parse_mode: 'Markdown' }
+    );
+    console.log(`✅ /start reply sent successfully`);
+  } catch (err) {
+    console.error(`❌ /start reply failed:`, err.message);
+  }
 });
 
 // Help command
 bot.command('help', async (ctx) => {
+  console.log(`📩 /help command received from user ${ctx.from.id}`);
   await ctx.reply(
     `📖 *How to use:*\n\n` +
     `1. Send a photo of an animal\n` +
