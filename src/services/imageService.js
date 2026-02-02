@@ -133,28 +133,28 @@ async function createCompositeImage(photoUrl, data) {
       !subspecies.toLowerCase().includes('null') &&
       !subspecies.toLowerCase().includes('unknown');
     
-    // === GENERATE BADGE SVG - 2 per row, balanced size ===
+    // === GENERATE BADGE SVG - 2 per row, larger size ===
     let badgeSvg = '';
-    const startY = 24;
-    const badgeHeight = 32;
-    const rowGap = 8;
+    const startY = 28;
+    const badgeHeight = 44;
+    const rowGap = 12;
     const padding = 20;
-    const maxBadgeWidth = 200;
+    const maxBadgeWidth = 240;
     
     allBadges.forEach((badge, index) => {
       const row = Math.floor(index / 2);
       const col = index % 2;
-      let badgeWidth = Math.min(badge.text.length * 11 + 48, maxBadgeWidth);
-      const xOffset = padding + col * (maxBadgeWidth + 10);
+      let badgeWidth = Math.min(badge.text.length * 14 + 58, maxBadgeWidth);
+      const xOffset = padding + col * (maxBadgeWidth + 12);
       const yOffset = startY + row * (badgeHeight + rowGap);
       
-      // Badge - proportional size
+      // Badge - larger proportional size
       badgeSvg += `
-        <rect x="${xOffset}" y="${yOffset}" width="${badgeWidth}" height="${badgeHeight}" rx="6" fill="${badge.color}"/>
-        <text x="${xOffset + 10}" y="${yOffset + 22}" font-family="${FONT_FAMILY}" font-size="16" font-weight="bold" fill="white">
+        <rect x="${xOffset}" y="${yOffset}" width="${badgeWidth}" height="${badgeHeight}" rx="8" fill="${badge.color}"/>
+        <text x="${xOffset + 12}" y="${yOffset + 30}" font-family="${FONT_FAMILY}" font-size="22" font-weight="bold" fill="white">
           ${badge.icon}
         </text>
-        <text x="${xOffset + 30}" y="${yOffset + 22}" font-family="${FONT_FAMILY}" font-size="14" font-weight="700" fill="white" letter-spacing="0.5">
+        <text x="${xOffset + 38}" y="${yOffset + 30}" font-family="${FONT_FAMILY}" font-size="18" font-weight="700" fill="white" letter-spacing="0.5">
           ${escapeXml(badge.text)}
         </text>
       `;
