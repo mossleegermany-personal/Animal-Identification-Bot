@@ -121,13 +121,15 @@ Use this geographic and temporal information to help identify the species/subspe
   let lastError = null;
 
   for (const modelInfo of MODELS) {
-    try {
-      console.log(`🔄 Trying ${modelInfo.displayName} (${modelInfo.name})...`);
-      
-      const model = genAI.getGenerativeModel({ 
-        model: modelInfo.name,
-        generationConfig: GENERATION_CONFIG
-      });
+    // Retry up to 3 times with exponential backoff for quota errors
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`🔄 Trying ${modelInfo.displayName} (attempt ${attempt}/3)...`);
+        
+        const model = genAI.getGenerativeModel({ 
+          model: modelInfo.name,
+          generationConfig: GENERATION_CONFIG
+        });
 
       // Add 60 second timeout
       const timeoutPromise = new Promise((_, reject) => 
@@ -184,20 +186,35 @@ Use this geographic and temporal information to help identify the species/subspe
 
     } catch (error) {
       console.log(`❌ ${modelInfo.displayName} failed: ${error.message}`);
-      console.log(`   Full error:`, error);
+      
+      // Check for quota/rate limit errors
+      const isQuotaError = error.message?.toLowerCase().includes('quota') ||
+                          error.message?.toLowerCase().includes('rate') ||
+                          error.message?.toLowerCase().includes('429') ||
+                          error.message?.toLowerCase().includes('resource exhausted');
+      
+      if (isQuotaError && attempt < 3) {
+        const waitTime = attempt * 20000; // 20s, 40s, 60s
+        console.log(`⏳ Quota limit hit. Waiting ${waitTime/1000}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue; // Retry same model
+      }
+      
       if (error.response) {
         console.log(`   Response status:`, error.response.status);
-        console.log(`   Response data:`, error.response.data);
       }
       lastError = error;
-      // Continue to next model
+      break; // Move to next model
+    }
     }
   }
 
   // All models failed
   return {
     success: false,
-    error: lastError?.message || 'All models failed'
+    error: lastError?.message?.includes('quota') || lastError?.message?.includes('Quota')
+      ? 'API quota exceeded. Please wait a minute and try again.'
+      : (lastError?.message || 'All models failed')
   };
 }
 

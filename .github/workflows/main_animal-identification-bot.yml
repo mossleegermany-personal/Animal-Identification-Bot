@@ -69,12 +69,16 @@ jobs:
               { "name": "TELEGRAM_BOT_TOKEN", "value": "${{ secrets.TELEGRAM_BOT_TOKEN }}" },
               { "name": "EBIRD_API_KEY", "value": "${{ secrets.EBIRD_API_KEY }}" },
               { "name": "PORT", "value": "3000" },
-              { "name": "WEBSITE_NODE_DEFAULT_VERSION", "value": "~20" }
+              { "name": "WEBSITE_NODE_DEFAULT_VERSION", "value": "~20" },
+              { "name": "WEBSITES_ENABLE_APP_SERVICE_STORAGE", "value": "false" },
+              { "name": "SCM_DO_BUILD_DURING_DEPLOYMENT", "value": "true" }
             ]
           general-settings-json: |
             {
               "linuxFxVersion": "NODE|20-lts",
-              "appCommandLine": "bash startup.sh"
+              "appCommandLine": "bash startup.sh",
+              "alwaysOn": true,
+              "healthCheckPath": "/health"
             }
 
       - name: 'Deploy to Azure Web App'
