@@ -89,11 +89,24 @@ async function isValidUrl(url) {
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
-// Set up bot commands menu
-bot.api.setMyCommands([
+// Bot commands list
+const botCommands = [
   { command: 'start', description: '🦁 Welcome message' },
   { command: 'help', description: '📖 Show help' },
+  { command: 'identify', description: '📷 How to identify animals' },
   { command: 'clear', description: '🗑️ Clear all chat messages' }
+];
+
+// Set up bot commands menu for all scopes (private chats, groups, etc.)
+Promise.all([
+  // Default scope (private chats)
+  bot.api.setMyCommands(botCommands),
+  // All group chats
+  bot.api.setMyCommands(botCommands, { scope: { type: 'all_group_chats' } }),
+  // All private chats
+  bot.api.setMyCommands(botCommands, { scope: { type: 'all_private_chats' } }),
+  // Set chat menu button to show commands
+  bot.api.setChatMenuButton({ menu_button: { type: 'commands' } })
 ]).catch(err => console.error('Failed to set commands:', err));
 
 // Store pending photos waiting for location (keyed by uniqueId = odels
@@ -106,13 +119,27 @@ bot.command('start', async (ctx) => {
     await ctx.reply(
       `🦁 *Wildlife ID Bot*\n\n` +
       `Send me a photo of any animal and I'll identify it!\n\n` +
-      `Tap the menu button (/) to see commands`,
+      `📷 Just send a photo - no commands needed!\n\n` +
+      `Tap the menu button ☰ to see all commands`,
       { parse_mode: 'Markdown' }
     );
     console.log(`✅ /start reply sent successfully`);
   } catch (err) {
     console.error(`❌ /start reply failed:`, err.message);
   }
+});
+
+// Identify command - show how to use
+bot.command('identify', async (ctx) => {
+  console.log(`📩 /identify command received from user ${ctx.from.id}`);
+  await ctx.reply(
+    `📷 *How to Identify Animals:*\n\n` +
+    `1️⃣ Send a photo of an animal\n` +
+    `2️⃣ Tell me the location (or I'll use GPS from photo)\n` +
+    `3️⃣ Get detailed identification!\n\n` +
+    `_Just send a photo to get started!_`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // Help command
