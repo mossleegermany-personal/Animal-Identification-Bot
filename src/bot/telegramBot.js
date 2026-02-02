@@ -2011,12 +2011,21 @@ async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, 
       // If we have an existing status message, edit it to ask for location
       let promptMsg;
       if (statusMsgId) {
-        await ctx.api.editMessageText(chatId, statusMsgId,
-          `🌍 *Where was this photo taken?*\n\n` +
-          `Reply with location or /skip`,
-          { parse_mode: 'Markdown' }
-        );
-        promptMsg = { message_id: statusMsgId };
+        try {
+          await ctx.api.editMessageText(chatId, statusMsgId,
+            `🌍 *Where was this photo taken?*\n\n` +
+            `Reply with location or /skip`,
+            { parse_mode: 'Markdown' }
+          );
+          promptMsg = { message_id: statusMsgId };
+        } catch (e) {
+          // Message may have been deleted, send new one
+          promptMsg = await ctx.api.sendMessage(chatId,
+            `🌍 *Where was this photo taken?*\n\n` +
+            `Reply with location or /skip`,
+            { parse_mode: 'Markdown', message_thread_id: threadId }
+          );
+        }
       } else {
         promptMsg = await ctx.api.sendMessage(chatId,
           `🌍 *Where was this photo taken?*\n\n` +
