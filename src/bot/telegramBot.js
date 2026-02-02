@@ -580,6 +580,53 @@ const rateLimiter = new WeeklyRateLimiter({
 });
 
 // ============================================
+// SUPERGROUP THREAD RESTRICTION
+// Only respond in specific forum topic threads
+// Set to null to allow all threads, or specify thread ID to restrict
+// ============================================
+const ALLOWED_THREAD_ID = 120466;  // Wildlife group thread ID in hikeandseeSG
+// Note: For supergroups with forum topics, the bot will only respond in this thread.
+// Set to null to respond in all threads.
+
+/**
+ * Check if message is from an allowed thread in supergroups
+ * @param {Context} ctx - Grammy context
+ * @returns {boolean} - true if allowed, false if should be ignored
+ */
+function isAllowedThread(ctx) {
+  const chat = ctx.chat;
+  const message = ctx.message || ctx.callbackQuery?.message;
+  
+  // Always allow private chats
+  if (chat.type === 'private') {
+    return true;
+  }
+  
+  // If no thread restriction is set, allow all
+  if (!ALLOWED_THREAD_ID) {
+    return true;
+  }
+  
+  // For supergroups with forum topics
+  if (chat.type === 'supergroup' && chat.is_forum) {
+    const threadId = message?.message_thread_id;
+    
+    if (threadId && threadId === ALLOWED_THREAD_ID) {
+      return true;
+    }
+    
+    // Not in allowed thread - silently ignore
+    if (threadId) {
+      console.log(`🚫 Message from thread ${threadId} ignored (only thread ${ALLOWED_THREAD_ID} allowed)`);
+    }
+    return false;
+  }
+  
+  // For regular groups (not supergroups with forums), allow based on rate limiter
+  return true;
+}
+
+// ============================================
 // IDENTIFICATION RESULT CACHE
 // Stores results keyed by chatId_scientificName for button callbacks
 // Supports multiple groups simultaneously
@@ -783,6 +830,7 @@ Promise.all([
 
 // Start command
 bot.command('start', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   console.log(`📩 /start command received from user ${ctx.from.id}`);
   try {
     await ctx.reply(
@@ -804,6 +852,7 @@ bot.command('start', async (ctx) => {
 
 // Identify command - show how to use
 bot.command('identify', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   console.log(`📩 /identify command received from user ${ctx.from.id}`);
   await ctx.reply(
     `📷 *How to Identify Animals:*\n\n` +
@@ -817,6 +866,7 @@ bot.command('identify', async (ctx) => {
 
 // Help command
 bot.command('help', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   console.log(`📩 /help command received from user ${ctx.from.id}`);
   await ctx.reply(
     `📖 *How to use:*\n\n` +
@@ -838,6 +888,7 @@ bot.command('help', async (ctx) => {
 
 // Limit command - check weekly usage
 bot.command('limit', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   const chatId = ctx.chat.id;
   const userId = ctx.from.id;
   const isPrivate = chatId > 0;
@@ -892,6 +943,7 @@ function generateProgressBar(used, limit) {
 
 // Menu command - show clickable buttons (for forum/topic groups)
 bot.command('menu', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   console.log(`📩 /menu command received from user ${ctx.from.id}`);
   const menuKeyboard = new InlineKeyboard()
     .text('🦁 Start', 'menu_start')
@@ -982,6 +1034,7 @@ bot.callbackQuery('menu_limit', async (ctx) => {
 
 // Clear command - delete ALL messages in chat (parallel deletion)
 bot.command('clear', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   const chatId = ctx.chat.id;
   const userId = ctx.from.id;
   const currentMsgId = ctx.message.message_id;
@@ -1022,6 +1075,7 @@ bot.command('clear', async (ctx) => {
 
 // Identify command - reply to a photo to identify it
 bot.command('identify', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   const chatId = ctx.chat.id;
   const userId = ctx.from.id;
   const replyToMessage = ctx.message.reply_to_message;
@@ -1156,6 +1210,7 @@ bot.command('identify', async (ctx) => {
 
 // Shortcut command /id - same as /identify
 bot.command('id', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   // Reuse the same logic as /identify
   const chatId = ctx.chat.id;
   const replyToMessage = ctx.message.reply_to_message;
@@ -1177,6 +1232,7 @@ bot.command('id', async (ctx) => {
 
 // Skip location command - process without location
 bot.command('skip', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
   
@@ -1250,6 +1306,7 @@ bot.command('skip', async (ctx) => {
 
 // Handle text messages (for location input)
 bot.on('message:text', async (ctx) => {
+  if (!isAllowedThread(ctx)) return;
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
   
@@ -1849,6 +1906,11 @@ bot.on('message:photo', async (ctx) => {
   const userId = ctx.from.id;
   const messageId = ctx.message.message_id;
   const mediaGroupId = ctx.message.media_group_id;
+  
+  // Check if message is from allowed thread (for supergroups with forum topics)
+  if (!isAllowedThread(ctx)) {
+    return; // Silently ignore messages from non-allowed threads
+  }
   
   console.log(`📷 Photo received: chatId=${chatId}, userId=${userId}, msgId=${messageId}, mediaGroupId=${mediaGroupId || 'none'}`);
   
