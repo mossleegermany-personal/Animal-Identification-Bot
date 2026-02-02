@@ -1743,15 +1743,16 @@ const mediaGroupCollector = new MediaGroupCollector();
 
 class SinglePhotoBatchCollector {
   constructor() {
-    /** @type {Map<string, {photos: Array, timer: NodeJS.Timeout, chatId: number, userId: number, threadId: number, resolvers: Function[]}>} */
+    /** @type {Map<string, {photos: Array, timer: NodeJS.Timeout, chatId: number, userId: number, threadId: number}>} */
     this.batches = new Map();
-    this.collectTimeout = 1500; // Wait 1.5 seconds to collect photos sent quickly
+    this.collectTimeout = 2000; // Wait 2 seconds to collect photos sent quickly
   }
 
   /**
    * Add a single photo - batches photos from same user/chat
+   * Returns immediately, doesn't wait for batch to complete
    * @param {Object} ctx - Grammy context
-   * @returns {Promise<Array|null>} Returns array of photos when collection is complete, null otherwise
+   * @returns {boolean} true if this is the first photo (will handle batch), false otherwise
    */
   addPhoto(ctx) {
     const chatId = ctx.chat.id;
@@ -1769,37 +1770,69 @@ class SinglePhotoBatchCollector {
       fileId: largestPhoto.file_id,
     };
 
-    return new Promise((resolve) => {
-      if (!this.batches.has(batchKey)) {
-        // First photo - start collecting
-        console.log(`📸 Starting new batch for ${batchKey}`);
-        this.batches.set(batchKey, {
-          photos: [photoData],
-          chatId,
-          userId,
-          threadId,
-          resolvers: [resolve], // Store all resolver functions
-          timer: setTimeout(() => {
-            // Collection complete
-            const batch = this.batches.get(batchKey);
-            this.batches.delete(batchKey);
-            if (batch) {
-              console.log(`📸 Single photo batch collected: ${batch.photos.length} photos from user ${userId} in chat ${chatId}`);
-              // Resolve first resolver with photos, others with null
-              batch.resolvers.forEach((res, index) => {
-                res(index === 0 ? batch.photos : null);
-              });
-            }
-          }, this.collectTimeout),
-        });
-      } else {
-        // Additional photo in batch
-        console.log(`📸 Adding photo to existing batch ${batchKey}`);
-        const batch = this.batches.get(batchKey);
-        batch.photos.push(photoData);
-        batch.resolvers.push(resolve); // Store this resolver too - will be resolved with null
+    if (!this.batches.has(batchKey)) {
+      // First photo - start collecting
+      console.log(`📸 Starting new batch for ${batchKey}`);
+      this.batches.set(batchKey, {
+        photos: [photoData],
+        chatId,
+        userId,
+        threadId,
+        timer: null, // Will be set below
+      });
+      return true; // First photo - this handler will manage the batch
+    } else {
+      // Additional photo in batch - reset timer to wait for more
+      console.log(`📸 Adding photo to existing batch ${batchKey}`);
+      const batch = this.batches.get(batchKey);
+      batch.photos.push(photoData);
+      
+      // Reset the timer to wait longer for more photos
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+        batch.timer = null;
       }
+      
+      return false; // Not the first photo - return early
+    }
+  }
+
+  /**
+   * Wait for batch collection to complete
+   * @param {string} batchKey
+   * @returns {Promise<Array>} collected photos
+   */
+  waitForBatch(batchKey) {
+    return new Promise((resolve) => {
+      const batch = this.batches.get(batchKey);
+      if (!batch) {
+        resolve([]);
+        return;
+      }
+
+      // Set/reset timer
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+      }
+      
+      batch.timer = setTimeout(() => {
+        const finalBatch = this.batches.get(batchKey);
+        this.batches.delete(batchKey);
+        if (finalBatch) {
+          console.log(`📸 Single photo batch collected: ${finalBatch.photos.length} photos`);
+          resolve(finalBatch.photos);
+        } else {
+          resolve([]);
+        }
+      }, this.collectTimeout);
     });
+  }
+
+  /**
+   * Get the batch key for a context
+   */
+  getBatchKey(ctx) {
+    return `batch_${ctx.chat.id}_${ctx.from.id}`;
   }
 }
 
@@ -1816,6 +1849,8 @@ bot.on('message:photo', async (ctx) => {
   const userId = ctx.from.id;
   const messageId = ctx.message.message_id;
   const mediaGroupId = ctx.message.media_group_id;
+  
+  console.log(`📷 Photo received: chatId=${chatId}, userId=${userId}, msgId=${messageId}, mediaGroupId=${mediaGroupId || 'none'}`);
   
   // For media groups, only show prompt once (on first photo)
   if (mediaGroupId) {
@@ -1869,10 +1904,20 @@ bot.on('message:photo', async (ctx) => {
   }
   
   // Single photo (no media_group_id) - use batch collector to group photos sent quickly
-  const collectedPhotos = await singlePhotoBatchCollector.addPhoto(ctx);
+  const isFirstPhoto = singlePhotoBatchCollector.addPhoto(ctx);
   
-  if (!collectedPhotos) {
-    // Not the first photo, will be handled by batch collector timer
+  if (!isFirstPhoto) {
+    // Not the first photo - it's been added to the batch, just return
+    console.log(`📷 Photo added to existing batch, returning early`);
+    return;
+  }
+  
+  // First photo - wait for batch collection to complete
+  const batchKey = singlePhotoBatchCollector.getBatchKey(ctx);
+  const collectedPhotos = await singlePhotoBatchCollector.waitForBatch(batchKey);
+  
+  if (!collectedPhotos || collectedPhotos.length === 0) {
+    console.log(`📷 No photos collected in batch`);
     return;
   }
   
