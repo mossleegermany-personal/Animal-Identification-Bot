@@ -1197,27 +1197,24 @@ bot.command('skip', async (ctx) => {
   const waitingFor = pendingRequest.waitingFor;
   const identifyTarget = pendingRequest.identifyTarget;
   const exifLocation = pendingRequest.exifLocation;
+  const threadId = pendingRequest.threadId;
   
   console.log(`⏭️ [${requestId}] Skip ${waitingFor || 'location'} in chat ${chatId}${isMediaGroup ? ' (media group)' : ''}`);
   
-  // Delete the prompt message
-  try {
-    await ctx.api.deleteMessage(chatId, pendingPromptMsgId);
-  } catch (e) {}
   // Delete the /skip command
   try {
     await ctx.api.deleteMessage(chatId, ctx.message.message_id);
   } catch (e) {}
   
+  // Update the prompt message to show "Analyzing..." (single bubble approach)
+  try {
+    await ctx.api.editMessageText(chatId, pendingPromptMsgId, '🔬 *Analyzing...*', { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error(`Failed to edit prompt message: ${e.message}`);
+  }
+  
   // Update status to processing
   requestManager.updateStatus(requestId, 'processing');
-  
-  // Delete status message for media groups
-  if (statusMsgId) {
-    try {
-      await ctx.api.deleteMessage(chatId, statusMsgId);
-    } catch (e) {}
-  }
   
   // Process without location
   const noLocation = 'Unknown location';
@@ -1232,9 +1229,9 @@ bot.command('skip', async (ctx) => {
       await ctx.reply(`❌ Error processing photos: ${error.message}`);
     }
   } else if (pendingBuffer) {
-    // Process single photo without location
+    // Process single photo without location - pass promptMsgId as statusMsgId
     try {
-      await processIdentification(ctx, pendingBuffer, noLocation, requestId, identifyTarget);
+      await processIdentificationWithChatId(ctx, pendingBuffer, noLocation, requestId, identifyTarget, chatId, threadId, pendingPromptMsgId);
       // Consume rate limit on successful completion
       const consumed = rateLimiter.consume(chatId, userId);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
@@ -1284,15 +1281,11 @@ bot.on('message:text', async (ctx) => {
     // Update status to processing BEFORE any async operations
     requestManager.updateStatus(requestId, 'processing');
     
-    // Delete the location prompt message
+    // The promptMsgId is now our single status bubble - update it to show "Analyzing..."
     try {
-      await ctx.api.deleteMessage(chatId, pendingPromptMsgId);
-    } catch (e) {}
-    // Delete status message for media groups
-    if (statusMsgId) {
-      try {
-        await ctx.api.deleteMessage(chatId, statusMsgId);
-      } catch (e) {}
+      await ctx.api.editMessageText(chatId, pendingPromptMsgId, '🔬 *Analyzing...*', { parse_mode: 'Markdown' });
+    } catch (e) {
+      console.error(`Failed to edit prompt message: ${e.message}`);
     }
     
     // Handle media group vs single photo
@@ -1308,7 +1301,10 @@ bot.on('message:text', async (ctx) => {
     } else {
       // Process single photo with captured context
       try {
-        await processIdentification(ctx, pendingBuffer, location, requestId, identifyTarget);
+        // Get threadId from pending request if available
+        const threadId = pendingRequest.threadId;
+        // Pass the promptMsgId as statusMsgId so it can be deleted when result is ready
+        await processIdentificationWithChatId(ctx, pendingBuffer, location, requestId, identifyTarget, chatId, threadId, pendingPromptMsgId);
         // Consume rate limit on successful completion
         const consumed = rateLimiter.consume(chatId, userId);
         console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
@@ -1419,16 +1415,27 @@ async function handleCallbackQuery(ctx) {
       const targetChatId = photoData.chatId;
       const targetThreadId = photoData.threadId;
       
+      // Edit the prompt message to show "Analyzing..." instead of deleting it
+      const promptMsgId = ctx.callbackQuery?.message?.message_id;
+      try {
+        await ctx.api.editMessageText(targetChatId, promptMsgId, '🔬 *Analyzing...*', { 
+          parse_mode: 'Markdown',
+          message_thread_id: targetThreadId 
+        });
+      } catch (e) {
+        console.log(`⚠️ Could not edit prompt to Analyzing: ${e.message}`);
+      }
+      
       // Create a request for tracking
-      const request = requestManager.createRequest(ctx, { chatId: targetChatId, userId, threadId: targetThreadId });
+      const request = requestManager.createRequest(ctx, { chatId: targetChatId, userId, threadId: targetThreadId, statusMsgId: promptMsgId });
       
       console.log(`📸 [${request.requestId}] Processing single photo from button for chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''} (${limitCheck.remaining} requests remaining)`);
       
       // Process the photo using stored file_id, original chat ID and thread ID
-      processSinglePhotoFromFileId(ctx, photoData.fileId, request, targetChatId, targetThreadId)
+      processSinglePhotoFromFileId(ctx, photoData.fileId, request, targetChatId, targetThreadId, promptMsgId)
         .catch(err => {
           requestManager.updateStatus(request.requestId, 'failed', { error: err });
-          ctx.api.sendMessage(targetChatId, `❌ Error: ${err.message}`).catch(() => {});
+          ctx.api.sendMessage(targetChatId, `❌ Error: ${err.message}`, { message_thread_id: targetThreadId }).catch(() => {});
         });
     }
     return;
@@ -1813,8 +1820,8 @@ bot.on('message:photo', async (ctx) => {
   
   // Show prompt with buttons
   await ctx.reply(
-    `📸 *Photo received!*\n\n` +
-    `Would you like me to identify the animal?`,
+    `📸 *1 photo received!*\n\n` +
+    `Would you like me to identify the animals?`,
     {
       parse_mode: 'Markdown',
       reply_to_message_id: messageId,
@@ -1837,8 +1844,9 @@ bot.on('message:photo', async (ctx) => {
  * @param {Object} request - Request object from RequestManager
  * @param {number} targetChatId - Target chat ID to send results to
  * @param {number} [targetThreadId] - Target thread ID for forum topics
+ * @param {number} [statusMsgId] - Existing status message ID to update/delete
  */
-async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, targetThreadId) {
+async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, targetThreadId, statusMsgId) {
   const { requestId } = request;
   const chatId = targetChatId || ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
   const threadId = targetThreadId || ctx.callbackQuery?.message?.message_thread_id;
@@ -1879,17 +1887,28 @@ async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, 
     if (exifLocation) {
       // Has EXIF location - process immediately (auto-identify all)
       console.log(`📍 [${requestId}] Has EXIF location, processing immediately...`);
-      await processIdentificationWithChatId(ctx, buffer, exifLocation, requestId, null, chatId, threadId);
+      await processIdentificationWithChatId(ctx, buffer, exifLocation, requestId, null, chatId, threadId, statusMsgId);
       const consumed = rateLimiter.consume(chatId, ctx.from.id);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
       requestManager.completeAndRemove(requestId);
     } else {
-      // No EXIF - ask for location only
-      const promptMsg = await ctx.api.sendMessage(chatId,
-        `🌍 *Where was this photo taken?*\n\n` +
-        `Reply with location or /skip`,
-        { parse_mode: 'Markdown', message_thread_id: threadId }
-      );
+      // No EXIF - need to ask for location
+      // If we have an existing status message, edit it to ask for location
+      let promptMsg;
+      if (statusMsgId) {
+        await ctx.api.editMessageText(chatId, statusMsgId,
+          `🌍 *Where was this photo taken?*\n\n` +
+          `Reply with location or /skip`,
+          { parse_mode: 'Markdown' }
+        );
+        promptMsg = { message_id: statusMsgId };
+      } else {
+        promptMsg = await ctx.api.sendMessage(chatId,
+          `🌍 *Where was this photo taken?*\n\n` +
+          `Reply with location or /skip`,
+          { parse_mode: 'Markdown', message_thread_id: threadId }
+        );
+      }
       
       // Store request state for location input
       const req = requestManager.getRequest(requestId);
@@ -2017,8 +2036,7 @@ async function processMediaGroup(photos, chatId, captionTarget = null) {
   
   // Send initial status message
   const statusMsg = await firstCtx.reply(
-    `📸 *Processing ${photoCount} photo${photoCount > 1 ? 's' : ''}...*\n\n` +
-    `Each photo will be identified separately.`,
+    `📸 *Processing ${photoCount} photo${photoCount > 1 ? 's' : ''}...*`,
     { parse_mode: 'Markdown' }
   );
   
@@ -2200,25 +2218,7 @@ async function processMediaGroupPhotos(ctx, processedPhotos, location, requestId
   
   // Send results
   if (speciesGroups.size > 0) {
-    // Send summary first
-    let summaryMsg = `📊 *Identification Results*\n\n`;
-    summaryMsg += `📸 Photos analyzed: ${validPhotos.length}\n`;
-    summaryMsg += `✅ Identified: ${results.filter(r => r.success).length}\n`;
-    if (failed.length > 0) {
-      summaryMsg += `❌ Failed: ${failed.length}\n`;
-    }
-    summaryMsg += `\n🦁 *Species found: ${speciesGroups.size}*\n`;
-    
-    for (const [species, group] of speciesGroups) {
-      summaryMsg += `\n• _${species}_ (${group.data.commonName})`;
-      if (group.count > 1) {
-        summaryMsg += ` — ${group.count} photos`;
-      }
-    }
-    
-    await ctx.reply(summaryMsg, { parse_mode: 'Markdown' });
-    
-    // Send detailed result for each unique species
+    // Send detailed result for each unique species (no summary header)
     for (const [species, group] of speciesGroups) {
       const d = group.data;
       d._originalImageBuffer = group.buffers[0]; // Use first photo for HD
@@ -2489,9 +2489,10 @@ async function processPhotoWithContext(ctx, request, captionTarget = null) {
  * @param {string} identifyTarget - What to identify
  * @param {number} targetChatId - Target chat ID to send results to
  * @param {number} [targetThreadId] - Target thread ID for forum topics
+ * @param {number} [statusMsgId] - Existing status message ID to use/delete
  */
-async function processIdentificationWithChatId(ctx, buffer, location, requestId, identifyTarget, targetChatId, targetThreadId) {
-  console.log(`🎯 [${requestId}] processIdentificationWithChatId targeting chat: ${targetChatId}${targetThreadId ? ` thread: ${targetThreadId}` : ''}`);
+async function processIdentificationWithChatId(ctx, buffer, location, requestId, identifyTarget, targetChatId, targetThreadId, statusMsgId) {
+  console.log(`🎯 [${requestId}] processIdentificationWithChatId targeting chat: ${targetChatId}${targetThreadId ? ` thread: ${targetThreadId}` : ''}${statusMsgId ? ` statusMsg: ${statusMsgId}` : ''}`);
   
   // Create a proxy context that redirects all messages to the target chat/thread
   const modifiedCtx = {
@@ -2499,6 +2500,7 @@ async function processIdentificationWithChatId(ctx, buffer, location, requestId,
     from: ctx.from,
     api: ctx.api,
     threadId: targetThreadId, // Store for use in processIdentification
+    statusMsgId: statusMsgId, // Existing status message to use
     // Override reply to always send to target chat and thread
     reply: (text, options = {}) => {
       console.log(`📤 [${requestId}] Sending message to chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''}`);
@@ -2525,12 +2527,20 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
   const targetChatId = ctx.chat.id;
   const targetUserId = ctx.from.id;
   const targetThreadId = ctx.threadId; // For forum topics
+  const existingStatusMsgId = ctx.statusMsgId; // Existing status message to reuse
   
-  console.log(`🎯 ${logPrefix} processIdentification: chat=${targetChatId}, thread=${targetThreadId || 'none'}`);
+  console.log(`🎯 ${logPrefix} processIdentification: chat=${targetChatId}, thread=${targetThreadId || 'none'}, statusMsg=${existingStatusMsgId || 'new'}`);
   
   try {
-    // Simple status message
-    statusMsg = await ctx.reply('🔬 *Analyzing...*', { parse_mode: 'Markdown' });
+    // Use existing status message or create new one
+    if (existingStatusMsgId) {
+      // Reuse existing message - create a reference object
+      statusMsg = { message_id: existingStatusMsgId };
+      console.log(`📝 ${logPrefix} Using existing status message: ${existingStatusMsgId}`);
+    } else {
+      // Create new status message
+      statusMsg = await ctx.reply('🔬 *Analyzing...*', { parse_mode: 'Markdown' });
+    }
 
     // Step 1: Identify with Gemini 2.5 Pro
     console.log(`\n🤖 ${logPrefix} Starting Gemini 2.5 Pro analysis...`);
