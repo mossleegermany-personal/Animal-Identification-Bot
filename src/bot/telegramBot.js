@@ -1124,26 +1124,16 @@ bot.command('identify', async (ctx) => {
         }
       }
     } else if (exifLocation) {
-      // Has EXIF, no target - ask what to identify
-      const promptMsg = await ctx.reply(
-        `🎯 *What would you like me to identify?*\n\n` +
-        `Reply with a description or /auto`,
-        { parse_mode: 'Markdown' }
-      );
-      
-      const req = requestManager.getRequest(request.requestId);
-      if (req) {
-        req.buffer = buffer;
-        req.promptMsgId = promptMsg.message_id;
-        req.exifLocation = exifLocation;
-        req.status = 'pending';
-        req.waitingFor = 'target';
-      }
+      // Has EXIF location - process immediately (auto-identify all)
+      await processIdentification(ctx, buffer, exifLocation, request.requestId, null);
+      const consumed = rateLimiter.consume(chatId, userId);
+      console.log(`📊 [${request.requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+      requestManager.completeAndRemove(request.requestId);
     } else {
-      // No EXIF, no target - ask what to identify first
+      // No EXIF - ask for location only
       const promptMsg = await ctx.reply(
-        `🎯 *What would you like me to identify?*\n\n` +
-        `Reply with a description or /auto`,
+        `🌍 *Where was this photo taken?*\n\n` +
+        `Reply with location or /skip`,
         { parse_mode: 'Markdown' }
       );
       
@@ -1152,7 +1142,8 @@ bot.command('identify', async (ctx) => {
         req.buffer = buffer;
         req.promptMsgId = promptMsg.message_id;
         req.status = 'pending';
-        req.waitingFor = 'target';
+        req.waitingFor = 'location';
+        req.identifyTarget = null; // Auto-identify all
       }
     }
   } catch (error) {
@@ -1217,39 +1208,6 @@ bot.command('skip', async (ctx) => {
     await ctx.api.deleteMessage(chatId, ctx.message.message_id);
   } catch (e) {}
   
-  // If waiting for target, skip to location question (or process if has EXIF)
-  if (waitingFor === 'target') {
-    const req = requestManager.getRequest(requestId);
-    if (req) {
-      req.identifyTarget = null; // Auto-detect
-      
-      if (exifLocation) {
-        // Has EXIF location - process immediately
-        requestManager.updateStatus(requestId, 'processing');
-        try {
-          await processIdentification(ctx, pendingBuffer, exifLocation, requestId, null);
-          const consumed = rateLimiter.consume(chatId, userId);
-          console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
-          requestManager.completeAndRemove(requestId);
-        } catch (error) {
-          requestManager.updateStatus(requestId, 'failed', { error });
-          requestManager._removeRequest(requestId);
-          await ctx.reply(`❌ Error: ${error.message}`);
-        }
-      } else {
-        // Ask for location
-        const promptMsg = await ctx.reply(
-          `🌍 *Where was this photo taken?*\n\n` +
-          `Reply with location or /skip`,
-          { parse_mode: 'Markdown' }
-        );
-        req.promptMsgId = promptMsg.message_id;
-        req.waitingFor = 'location';
-      }
-    }
-    return;
-  }
-  
   // Update status to processing
   requestManager.updateStatus(requestId, 'processing');
   
@@ -1292,65 +1250,7 @@ bot.command('skip', async (ctx) => {
   }
 });
 
-// Auto command - skip target selection and identify automatically
-bot.command('auto', async (ctx) => {
-  const userId = ctx.from.id;
-  const chatId = ctx.chat.id;
-  
-  const pendingRequest = requestManager.findPendingRequest(userId, chatId);
-  
-  if (!pendingRequest) {
-    await ctx.reply('❌ No pending identification request.');
-    return;
-  }
-  
-  // Only works when waiting for target
-  if (pendingRequest.waitingFor !== 'target') {
-    await ctx.reply('❌ Use /skip to skip location input.');
-    return;
-  }
-  
-  const requestId = pendingRequest.requestId;
-  
-  // Delete prompt and command
-  try {
-    await ctx.api.deleteMessage(chatId, pendingRequest.promptMsgId);
-  } catch (e) {}
-  try {
-    await ctx.api.deleteMessage(chatId, ctx.message.message_id);
-  } catch (e) {}
-  
-  const req = requestManager.getRequest(requestId);
-  if (req) {
-    req.identifyTarget = null; // Auto-detect
-    
-    if (req.exifLocation) {
-      // Has EXIF location - process immediately
-      requestManager.updateStatus(requestId, 'processing');
-      try {
-        await processIdentification(ctx, req.buffer, req.exifLocation, requestId, null);
-        const consumed = rateLimiter.consume(chatId, userId);
-        console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
-        requestManager.completeAndRemove(requestId);
-      } catch (error) {
-        requestManager.updateStatus(requestId, 'failed', { error });
-        requestManager._removeRequest(requestId);
-        await ctx.reply(`❌ Error: ${error.message}`);
-      }
-    } else {
-      // Ask for location
-      const promptMsg = await ctx.reply(
-        `🌍 *Where was this photo taken?*\n\n` +
-        `Reply with location or /skip`,
-        { parse_mode: 'Markdown' }
-      );
-      req.promptMsgId = promptMsg.message_id;
-      req.waitingFor = 'location';
-    }
-  }
-});
-
-// Handle text messages (for target and location input)
+// Handle text messages (for location input)
 bot.on('message:text', async (ctx) => {
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
@@ -1367,54 +1267,7 @@ bot.on('message:text', async (ctx) => {
       await ctx.api.deleteMessage(chatId, ctx.message.message_id);
     } catch (e) {}
     
-    // Check what we're waiting for
-    if (pendingRequest.waitingFor === 'target') {
-      // User is providing what to identify
-      console.log(`🎯 [${requestId}] Target received in chat ${chatId}: "${userInput}"`);
-      
-      // Delete the target prompt message
-      try {
-        await ctx.api.deleteMessage(chatId, pendingRequest.promptMsgId);
-      } catch (e) {}
-      
-      // Store the identification target
-      const req = requestManager.getRequest(requestId);
-      if (req) {
-        req.identifyTarget = userInput;
-        
-        // Check if we already have EXIF location
-        if (req.exifLocation) {
-          // Has location - process immediately
-          console.log(`📍 [${requestId}] Using EXIF location, starting identification...`);
-          requestManager.updateStatus(requestId, 'processing');
-          
-          try {
-            await processIdentification(ctx, req.buffer, req.exifLocation, requestId, req.identifyTarget);
-            const consumed = rateLimiter.consume(chatId, userId);
-            console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
-            requestManager.completeAndRemove(requestId);
-          } catch (error) {
-            requestManager.updateStatus(requestId, 'failed', { error });
-            requestManager._removeRequest(requestId);
-            await ctx.reply(`❌ Error: ${error.message}`);
-          }
-        } else {
-          // No EXIF - now ask for location
-          const promptMsg = await ctx.reply(
-            `🌍 *Where was this photo taken?*\n\n` +
-            `Reply with location or /skip`,
-            { parse_mode: 'Markdown' }
-          );
-          
-          req.promptMsgId = promptMsg.message_id;
-          req.waitingFor = 'location';
-          console.log(`⏳ [${requestId}] Now waiting for location input...`);
-        }
-      }
-      return;
-    }
-    
-    // Otherwise, user is providing location
+    // User is providing location
     const location = userInput;
     
     // Capture values locally to ensure correct context
@@ -2010,26 +1863,34 @@ async function processSinglePhotoFromFileId(ctx, fileId, request) {
       .png({ compressionLevel: 0, effort: 1 })
       .toBuffer();
     
-    // Ask what to identify
-    const promptMsg = await ctx.reply(
-      `🎯 *What would you like me to identify?*\n\n` +
-      `• Reply with what you want identified (e.g., "the bird on the left")\n` +
-      `• Or use /auto to identify all animals`,
-      { parse_mode: 'Markdown' }
-    );
-    
-    // Store request state for target selection (use same property names as text handler expects)
-    const req = requestManager.getRequest(requestId);
-    if (req) {
-      req.buffer = buffer;
-      req.exifLocation = exifLocation;
-      req.promptMsgId = promptMsg.message_id;
-      req.waitingFor = 'target';
-      req.chatId = chatId;
-      req.status = 'pending';
+    if (exifLocation) {
+      // Has EXIF location - process immediately (auto-identify all)
+      console.log(`📍 [${requestId}] Has EXIF location, processing immediately...`);
+      await processIdentification(ctx, buffer, exifLocation, requestId, null);
+      const consumed = rateLimiter.consume(chatId, ctx.from.id);
+      console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+      requestManager.completeAndRemove(requestId);
+    } else {
+      // No EXIF - ask for location only
+      const promptMsg = await ctx.reply(
+        `🌍 *Where was this photo taken?*\n\n` +
+        `Reply with location or /skip`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      // Store request state for location input
+      const req = requestManager.getRequest(requestId);
+      if (req) {
+        req.buffer = buffer;
+        req.promptMsgId = promptMsg.message_id;
+        req.waitingFor = 'location';
+        req.identifyTarget = null; // Auto-identify all
+        req.chatId = chatId;
+        req.status = 'pending';
+      }
+      
+      console.log(`⏳ [${requestId}] Waiting for location input...`);
     }
-    
-    console.log(`⏳ [${requestId}] Waiting for target selection...`);
     
   } catch (error) {
     console.error(`❌ [${requestId}] Error:`, error.message);
@@ -2565,32 +2426,18 @@ async function processPhotoWithContext(ctx, request, captionTarget = null) {
         }
       }
     } else if (exifLocation) {
-      // No caption target, but has GPS - ask what to identify
-      console.log(`📍 [${requestId}] Has EXIF location, asking what to identify...`);
-      const promptMsg = await ctx.reply(
-        `🎯 *What would you like me to identify?*\n\n` +
-        `Reply with a description (e.g., "the bird on the left", "the butterfly")\n` +
-        `Or /auto to identify automatically`,
-        { parse_mode: 'Markdown' }
-      );
-      
-      // Update request with pending photo data
-      const req = requestManager.getRequest(requestId);
-      if (req) {
-        req.buffer = buffer;
-        req.promptMsgId = promptMsg.message_id;
-        req.exifLocation = exifLocation;
-        req.status = 'pending';
-        req.waitingFor = 'target'; // Waiting for what to identify
-        console.log(`⏳ [${requestId}] Waiting for identification target...`);
-      }
+      // No caption target, but has GPS - process immediately (auto-identify all)
+      console.log(`📍 [${requestId}] Has EXIF location, processing immediately...`);
+      await processIdentification(ctx, buffer, exifLocation, requestId, null);
+      const consumed = rateLimiter.consume(ctx.chat.id, ctx.from.id);
+      console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
+      requestManager.completeAndRemove(requestId);
     } else {
-      // No caption target, no EXIF - ask what to identify first
-      console.log(`📍 [${requestId}] No EXIF GPS, asking what to identify...`);
+      // No caption target, no EXIF - ask for location only
+      console.log(`📍 [${requestId}] No EXIF GPS, asking for location...`);
       const promptMsg = await ctx.reply(
-        `🎯 *What would you like me to identify?*\n\n` +
-        `Reply with a description (e.g., "the bird on the left", "the butterfly")\n` +
-        `Or /auto to identify automatically`,
+        `🌍 *Where was this photo taken?*\n\n` +
+        `Reply with location or /skip`,
         { parse_mode: 'Markdown' }
       );
       
@@ -2600,8 +2447,9 @@ async function processPhotoWithContext(ctx, request, captionTarget = null) {
         req.buffer = buffer;
         req.promptMsgId = promptMsg.message_id;
         req.status = 'pending';
-        req.waitingFor = 'target'; // Waiting for what to identify
-        console.log(`⏳ [${requestId}] Waiting for identification target...`);
+        req.waitingFor = 'location';
+        req.identifyTarget = null; // Auto-identify all
+        console.log(`⏳ [${requestId}] Waiting for location input...`);
       }
     }
   } catch (error) {
