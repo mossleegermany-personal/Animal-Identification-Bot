@@ -76,9 +76,7 @@ jobs:
           general-settings-json: |
             {
               "linuxFxVersion": "NODE|20-lts",
-              "appCommandLine": "bash startup.sh",
-              "alwaysOn": true,
-              "healthCheckPath": "/health"
+              "appCommandLine": "bash startup.sh"
             }
 
       - name: 'Deploy to Azure Web App'
