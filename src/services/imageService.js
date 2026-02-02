@@ -2,8 +2,9 @@
 
 const sharp = require('sharp');
 
-// Font family that works across systems (Azure Linux, macOS, Windows)
-const FONT_FAMILY = 'sans-serif';
+// Font family - DejaVu Sans is installed via startup.sh on Azure
+// Falls back to system fonts on local development
+const FONT_FAMILY = 'DejaVu Sans, Liberation Sans, FreeSans, sans-serif';
 
 /**
  * Create a composite image with photo on left, text panel on right

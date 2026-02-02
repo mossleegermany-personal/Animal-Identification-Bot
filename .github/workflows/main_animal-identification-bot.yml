@@ -67,6 +67,11 @@ jobs:
               { "name": "PORT", "value": "3000" },
               { "name": "WEBSITE_NODE_DEFAULT_VERSION", "value": "~20" }
             ]
+          general-settings-json: |
+            {
+              "linuxFxVersion": "NODE|20-lts",
+              "appCommandLine": "bash startup.sh"
+            }
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
