@@ -1415,16 +1415,20 @@ async function handleCallbackQuery(ctx) {
       
       pendingPhotos.delete(key);
       
+      // Use the original chat ID and thread ID where the photo was sent (important for groups/forums)
+      const targetChatId = photoData.chatId;
+      const targetThreadId = photoData.threadId;
+      
       // Create a request for tracking
-      const request = requestManager.createRequest(ctx, { chatId, userId });
+      const request = requestManager.createRequest(ctx, { chatId: targetChatId, userId, threadId: targetThreadId });
       
-      console.log(`📸 [${request.requestId}] Processing single photo from button (${limitCheck.remaining} requests remaining)`);
+      console.log(`📸 [${request.requestId}] Processing single photo from button for chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''} (${limitCheck.remaining} requests remaining)`);
       
-      // Process the photo using stored file_id
-      processSinglePhotoFromFileId(ctx, photoData.fileId, request)
+      // Process the photo using stored file_id, original chat ID and thread ID
+      processSinglePhotoFromFileId(ctx, photoData.fileId, request, targetChatId, targetThreadId)
         .catch(err => {
           requestManager.updateStatus(request.requestId, 'failed', { error: err });
-          ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
+          ctx.api.sendMessage(targetChatId, `❌ Error: ${err.message}`).catch(() => {});
         });
     }
     return;
@@ -1790,6 +1794,9 @@ bot.on('message:photo', async (ctx) => {
   const photos = ctx.message.photo;
   const largestPhoto = photos[photos.length - 1];
   
+  // Get message_thread_id for forum topics (like Wildlife topic)
+  const threadId = ctx.message.message_thread_id;
+  
   // Store photo info temporarily for later processing (include photo file_id)
   const photoKey = `photo_${chatId}_${userId}_${messageId}`;
   pendingPhotos.set(photoKey, {
@@ -1797,6 +1804,7 @@ bot.on('message:photo', async (ctx) => {
     chatId,
     userId,
     fileId: largestPhoto.file_id,
+    threadId, // Forum topic thread ID
     timestamp: Date.now(),
   });
   
@@ -1827,10 +1835,14 @@ bot.on('message:photo', async (ctx) => {
  * @param {Context} ctx - grammy context
  * @param {string} fileId - Telegram file ID
  * @param {Object} request - Request object from RequestManager
+ * @param {number} targetChatId - Target chat ID to send results to
+ * @param {number} [targetThreadId] - Target thread ID for forum topics
  */
-async function processSinglePhotoFromFileId(ctx, fileId, request) {
+async function processSinglePhotoFromFileId(ctx, fileId, request, targetChatId, targetThreadId) {
   const { requestId } = request;
-  const chatId = ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
+  const chatId = targetChatId || ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
+  const threadId = targetThreadId || ctx.callbackQuery?.message?.message_thread_id;
+  console.log(`🎯 [${requestId}] Target chat for results: ${chatId}${threadId ? ` (thread ${threadId})` : ''}`);
   
   try {
     requestManager.updateStatus(requestId, 'processing');
@@ -1867,16 +1879,16 @@ async function processSinglePhotoFromFileId(ctx, fileId, request) {
     if (exifLocation) {
       // Has EXIF location - process immediately (auto-identify all)
       console.log(`📍 [${requestId}] Has EXIF location, processing immediately...`);
-      await processIdentification(ctx, buffer, exifLocation, requestId, null);
+      await processIdentificationWithChatId(ctx, buffer, exifLocation, requestId, null, chatId, threadId);
       const consumed = rateLimiter.consume(chatId, ctx.from.id);
       console.log(`📊 [${requestId}] Rate limit consumed: ${consumed.used} used, ${consumed.remaining} remaining`);
       requestManager.completeAndRemove(requestId);
     } else {
       // No EXIF - ask for location only
-      const promptMsg = await ctx.reply(
+      const promptMsg = await ctx.api.sendMessage(chatId,
         `🌍 *Where was this photo taken?*\n\n` +
         `Reply with location or /skip`,
-        { parse_mode: 'Markdown' }
+        { parse_mode: 'Markdown', message_thread_id: threadId }
       );
       
       // Store request state for location input
@@ -1887,6 +1899,7 @@ async function processSinglePhotoFromFileId(ctx, fileId, request) {
         req.waitingFor = 'location';
         req.identifyTarget = null; // Auto-identify all
         req.chatId = chatId;
+        req.threadId = threadId; // Forum topic thread ID
         req.status = 'pending';
       }
       
@@ -2467,6 +2480,36 @@ async function processPhotoWithContext(ctx, request, captionTarget = null) {
 // ============================================
 
 /**
+ * Process animal identification with explicit chat ID
+ * Wrapper that ensures results are sent to the correct chat/thread
+ * @param {Object} ctx - Grammy context
+ * @param {Buffer} buffer - Image buffer
+ * @param {string} location - Location string
+ * @param {string} requestId - Request ID for logging
+ * @param {string} identifyTarget - What to identify
+ * @param {number} targetChatId - Target chat ID to send results to
+ * @param {number} [targetThreadId] - Target thread ID for forum topics
+ */
+async function processIdentificationWithChatId(ctx, buffer, location, requestId, identifyTarget, targetChatId, targetThreadId) {
+  console.log(`🎯 [${requestId}] processIdentificationWithChatId targeting chat: ${targetChatId}${targetThreadId ? ` thread: ${targetThreadId}` : ''}`);
+  
+  // Create a proxy context that redirects all messages to the target chat/thread
+  const modifiedCtx = {
+    chat: { id: targetChatId },
+    from: ctx.from,
+    api: ctx.api,
+    threadId: targetThreadId, // Store for use in processIdentification
+    // Override reply to always send to target chat and thread
+    reply: (text, options = {}) => {
+      console.log(`📤 [${requestId}] Sending message to chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''}`);
+      return ctx.api.sendMessage(targetChatId, text, { ...options, message_thread_id: targetThreadId });
+    },
+  };
+  
+  return processIdentification(modifiedCtx, buffer, location, requestId, identifyTarget);
+}
+
+/**
  * Process animal identification
  * @param {Object} ctx - Grammy context (bound to specific user/chat)
  * @param {Buffer} buffer - Image buffer
@@ -2481,6 +2524,9 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
   // Capture user/chat context at start to ensure correct delivery
   const targetChatId = ctx.chat.id;
   const targetUserId = ctx.from.id;
+  const targetThreadId = ctx.threadId; // For forum topics
+  
+  console.log(`🎯 ${logPrefix} processIdentification: chat=${targetChatId}, thread=${targetThreadId || 'none'}`);
   
   try {
     // Simple status message
@@ -2654,7 +2700,7 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
     
     // Send composite image (photo left, text right with badges) with buttons
     // Use ctx.api.sendPhoto with targetChatId to ensure correct delivery
-    console.log(`📤 ${logPrefix} Sending result to chat ${targetChatId}...`);
+    console.log(`📤 ${logPrefix} Sending result to chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''}...`);
     
     if (iNatPhoto.found && iNatPhoto.photoUrl) {
       try {
@@ -2662,11 +2708,13 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
         
         if (compositeBuffer) {
           const caption = linksText || '';
-          await ctx.api.sendPhoto(targetChatId, new InputFile(compositeBuffer, 'identification.jpg'), {
+          const sentMsg = await ctx.api.sendPhoto(targetChatId, new InputFile(compositeBuffer, 'identification.jpg'), {
             caption: caption,
             parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: followUpButtons }
+            reply_markup: { inline_keyboard: followUpButtons },
+            message_thread_id: targetThreadId
           });
+          console.log(`✅ ${logPrefix} Photo sent, message_id: ${sentMsg.message_id}`);
         } else {
           // Fallback to regular photo with caption
           const subspecies = d.taxonomy?.subspecies;
@@ -2680,7 +2728,8 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
           await ctx.api.sendPhoto(targetChatId, iNatPhoto.photoUrl, { 
             caption: caption,
             parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: followUpButtons }
+            reply_markup: { inline_keyboard: followUpButtons },
+            message_thread_id: targetThreadId
           });
         }
       } catch (e) {
@@ -2694,7 +2743,8 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
         const subspeciesText = hasValidSubspecies ? `\n\nSubspecies: _${subspecies}_` : '';
         await ctx.api.sendMessage(targetChatId, `*${d.commonName}*\n_${d.scientificName}_${subspeciesText}${linksText ? `\n\n${linksText}` : ''}`, { 
           parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: followUpButtons }
+          reply_markup: { inline_keyboard: followUpButtons },
+          message_thread_id: targetThreadId
         });
       }
     } else {
@@ -2708,18 +2758,19 @@ async function processIdentification(ctx, buffer, location, requestId = 'unknown
       const subspeciesText = hasValidSubspecies ? `\n\nSubspecies: _${subspecies}_` : '';
       await ctx.api.sendMessage(targetChatId, `*${d.commonName}*\n_${d.scientificName}_${subspeciesText}${linksText ? `\n\n${linksText}` : ''}`, { 
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: followUpButtons }
+        reply_markup: { inline_keyboard: followUpButtons },
+        message_thread_id: targetThreadId
       });
     }
     
-    console.log(`✅ ${logPrefix} Result sent to user ${targetUserId} in chat ${targetChatId}`);
+    console.log(`✅ ${logPrefix} Result sent to user ${targetUserId} in chat ${targetChatId}${targetThreadId ? ` thread ${targetThreadId}` : ''}`);
     
   } catch (error) {
     console.error(`❌ ${logPrefix} Error:`, error);
     try {
       if (statusMsg) await ctx.api.deleteMessage(targetChatId, statusMsg.message_id);
     } catch (e) {}
-    await ctx.api.sendMessage(targetChatId, `❌ Error: ${error.message}`);
+    await ctx.api.sendMessage(targetChatId, `❌ Error: ${error.message}`, { message_thread_id: targetThreadId });
   }
 }
 
